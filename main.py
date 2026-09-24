@@ -1,7 +1,16 @@
 import os
 import time
+import threading
 import requests
 import numpy as np
+from flask import Flask
+
+# --- FLASK DUMMY SERVER FOR FREE TIER HEALTH CHECKS ---
+app = Flask(__name__)
+
+@app.route('/')
+def health_check():
+    return "Markov 2.0 Engine Active", 200
 
 # --- CONFIGURATION & SAFETY GATES ---
 PAPER_TRADING = True  # Set to False when ready to trade real SOL
@@ -107,7 +116,7 @@ def post_familiars_callout(mint, symbol, signal_s):
     except Exception as e:
         print(f"[FAMILIARS ERROR] Could not post callout: {e}")
 
-def run_loop():
+def run_trading_loop():
     print(f"--- Markov 2.0 Engine Starting (Paper Mode: {PAPER_TRADING}) ---")
     
     while True:
@@ -140,4 +149,10 @@ def run_loop():
         time.sleep(30)
 
 if __name__ == "__main__":
-    run_loop()
+    # Start trading engine in a background thread
+    trading_thread = threading.Thread(target=run_trading_loop, daemon=True)
+    trading_thread.start()
+    
+    # Start web server bound to Render's assigned PORT
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
