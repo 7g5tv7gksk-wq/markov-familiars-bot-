@@ -1,3 +1,4 @@
 requests==2.31.0
 numpy==1.26.4
 solders==0.21.0
+flask==3.0.3
