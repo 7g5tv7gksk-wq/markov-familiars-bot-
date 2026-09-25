@@ -21,7 +21,7 @@ def run_flask():
 # CONFIGURATION & STATE TRACKING
 # =====================================================================
 PAPER_TRADING = True  # Set to False when ready for live SOL execution
-SOL_TRADE_SIZE = 0.03 # Paper trade size in SOL
+SOL_TRADE_SIZE = 0.03 # Paper trade size in SOL (Use 0.1 SOL for live)
 MIN_LIQUIDITY_USD = 3000.0
 
 # Market Cap Filters
@@ -56,33 +56,36 @@ trade_stats = {
 }
 
 # =====================================================================
-# ORGANIC CANDIDATE SCRAPER (ORGANIC TRENDING vs BOOSTED)
+# ORGANIC CANDIDATE SCRAPER (MULTI-QUERY DEX + PROFILES + JUPITER)
 # =====================================================================
 def fetch_organic_candidates():
     """
-    Fetches tokens with active organic momentum from recent profile updates
-    and direct Solana DEX searches rather than paid boost lists.
+    Fetches active Solana token mints across multiple DexScreener search terms
+    and fallback endpoints to ensure the scanner always has candidates to evaluate.
     """
     candidate_mints = []
 
-    # Source A: DEX Search for active Solana trading pairs
-    try:
-        search_url = "https://api.dexscreener.com/latest/dex/search?q=SOL"
-        res = requests.get(search_url, timeout=8)
-        if res.status_code == 200:
-            pairs = res.json().get('pairs', [])
-            for p in pairs:
-                if p.get('chainId') == 'solana':
-                    base_mint = p.get('baseToken', {}).get('address')
-                    if base_mint and base_mint not in candidate_mints:
-                        candidate_mints.append(base_mint)
-    except Exception:
-        pass
+    # Source A: Multi-query search across active Solana DEX pairs
+    search_terms = ["pump", "sol", "raydium", "moon"]
+    for term in search_terms:
+        try:
+            url = f"https://api.dexscreener.com/latest/dex/search?q={term}"
+            res = requests.get(url, timeout=5)
+            if res.status_code == 200:
+                pairs = res.json().get('pairs', [])
+                if pairs:
+                    for p in pairs:
+                        if p.get('chainId') == 'solana':
+                            base_mint = p.get('baseToken', {}).get('address')
+                            if base_mint and base_mint not in candidate_mints:
+                                candidate_mints.append(base_mint)
+        except Exception:
+            pass
 
-    # Source B: Token Profiles (Recent Organic Activity Updates)
+    # Source B: Token Profiles (Recent Updates)
     try:
         profile_url = "https://api.dexscreener.com/token-profiles/recent-updates/v1"
-        res = requests.get(profile_url, timeout=8)
+        res = requests.get(profile_url, timeout=5)
         if res.status_code == 200:
             profiles = res.json()
             if isinstance(profiles, list):
@@ -94,7 +97,22 @@ def fetch_organic_candidates():
     except Exception:
         pass
 
-    return candidate_mints[:25]  # Process top candidates
+    # Source C: Fallback to Jupiter's Public Token API if candidates list is thin
+    if len(candidate_mints) < 10:
+        try:
+            jup_url = "https://tokens.jup.ag/tokens?tags=verified"
+            res = requests.get(jup_url, timeout=5)
+            if res.status_code == 200:
+                tokens = res.json()
+                for t in tokens[:30]:
+                    addr = t.get('address')
+                    if addr and addr not in candidate_mints:
+                        candidate_mints.append(addr)
+        except Exception:
+            pass
+
+    print(f"📡 [SCRAPER] Fetched {len(candidate_mints)} candidate mints for evaluation.")
+    return candidate_mints[:30]
 
 # =====================================================================
 # SAFETY & ORGANIC MOMENTUM FILTERS
