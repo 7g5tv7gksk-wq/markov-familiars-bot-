@@ -43,7 +43,7 @@ trade_stats = {
 }
 
 # =====================================================================
-# MULTI-SOURCE ORGANIC CANDIDATE SCRAPER (DEX + PROFILES + JUPITER)
+# MULTI-SOURCE ORGANIC CANDIDATE SCRAPER
 # =====================================================================
 def fetch_organic_candidates():
     """
@@ -102,7 +102,7 @@ def fetch_organic_candidates():
     return candidate_mints[:30]
 
 # =====================================================================
-# GMGN & RUGCHECK SECURITY GUARDS
+# SECURITY GUARDS (GMGN & RUGCHECK)
 # =====================================================================
 def check_gmgn_security(token_mint):
     """Checks GMGN endpoint for hidden risks (Bundlers > 10%, high rug ratio)."""
@@ -115,11 +115,11 @@ def check_gmgn_security(token_mint):
             rug_ratio = float(data.get('rug_ratio', 0) or 0)
             
             if bundler_pct > 10.0:
-                print(f"⚠️ [GMGN REJECT] {token_mint} | Bundler Cluster High: {bundler_pct:.1f}%")
+                print(f"⚠️ [GMGN REJECT] {token_mint[:6]}... | Bundler Cluster High: {bundler_pct:.1f}%")
                 return False
                 
             if rug_ratio > 0.30:
-                print(f"⚠️ [GMGN REJECT] {token_mint} | High Rug Risk Score: {rug_ratio:.2f}")
+                print(f"⚠️ [GMGN REJECT] {token_mint[:6]}... | High Rug Risk Score: {rug_ratio:.2f}")
                 return False
                 
             return True
@@ -152,7 +152,13 @@ def get_dex_pair_data(token_mint):
     """Enforces Organic Volume Ratio, Market Cap ($10k-$250k), and Anti-Falling-Knife filters."""
     try:
         url = f"https://api.dexscreener.com/latest/dex/tokens/{token_mint}"
-        res = requests.get(url, timeout=10)
+        res = requests.get(url, timeout=5)
+        
+        if res.status_code == 429:
+            print("⚠️ [DEX RATE LIMIT] Throttled by DexScreener. Backing off...")
+            time.sleep(2)
+            return None
+
         if res.status_code != 200:
             return None
         
@@ -162,22 +168,22 @@ def get_dex_pair_data(token_mint):
             return None
         
         pair = pairs[0]
-        liquidity = pair.get('liquidity', {}).get('usd', 0)
-        
+        liquidity = float(pair.get('liquidity', {}).get('usd', 0) or 0)
+        mc = float(pair.get('marketCap') or pair.get('fdv', 0) or 0)
+
         if liquidity < MIN_LIQUIDITY_USD:
             return None
 
-        mc = pair.get('marketCap') or pair.get('fdv', 0)
         if mc < MIN_MARKET_CAP or mc > MAX_MARKET_CAP:
             return None
 
-        v5m = pair.get('volume', {}).get('m5', 0) or 0
+        v5m = float(pair.get('volume', {}).get('m5', 0) or 0)
         if v5m < MIN_5M_VOLUME:
             return None
 
         price_change = pair.get('priceChange', {})
-        h6 = price_change.get('h6', 0) or 0
-        h24 = price_change.get('h24', 0) or 0
+        h6 = float(price_change.get('h6', 0) or 0)
+        h24 = float(price_change.get('h24', 0) or 0)
         if h6 < MAX_MACRO_DRAWDOWN or h24 < MAX_MACRO_DRAWDOWN:
             return None
 
@@ -214,11 +220,28 @@ def compute_markov_differential(pair):
 
     return round(S * volume_weight, 2)
 
+def post_to_familiars(content):
+    """Publishes agent callouts directly to familiars.family public feed."""
+    if not FAMILIARS_API_KEY:
+        return
+
+    url = f"{BASE_FAMILIARS_URL}/api/posts"
+    headers = {
+        "Authorization": f"Bearer {FAMILIARS_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {"content": content}
+
+    try:
+        requests.post(url, json=payload, headers=headers, timeout=10)
+    except Exception:
+        pass
+
 # =====================================================================
-# JUPITER REAL-TIME PRICE FEED (V2) & 1-SECOND MONITOR THREAD
+# JUPITER REAL-TIME PRICE FEED & 1-SECOND MONITOR THREAD
 # =====================================================================
 def get_realtime_price(token_mint):
-    """Fetches real-time execution price directly from Jupiter API v2."""
+    """Fetches real-time price directly from Jupiter API v2."""
     try:
         url = f"https://api.jup.ag/price/v2?ids={token_mint}"
         res = requests.get(url, timeout=2)
@@ -271,6 +294,7 @@ def run_position_monitor():
 
                         print(f"\n🎯 [TAKE PROFIT HIT] ${symbol} | Gain: +{pnl_pct*100:.2f}% (+{sol_gained:.4f} SOL)")
                         print(f"📊 [STATS] Closed: {trade_stats['total_closed']} | WR: {win_rate:.1f}% | Net PnL: {trade_stats['net_sol_pnl']:+.4f} SOL")
+                        post_to_familiars(f"🎉 [PAPER TP] Closed ${symbol} ({mint[:6]}...) at +{pnl_pct*100:.2f}%!")
                         mints_to_close.append(mint)
 
                     # 2. STOP LOSS (-12%)
@@ -283,6 +307,7 @@ def run_position_monitor():
 
                         print(f"\n🛑 [STOP LOSS HIT] ${symbol} | Loss: {pnl_pct*100:.2f}% ({sol_lost:.4f} SOL)")
                         print(f"📊 [STATS] Closed: {trade_stats['total_closed']} | WR: {win_rate:.1f}% | Net PnL: {trade_stats['net_sol_pnl']:+.4f} SOL")
+                        post_to_familiars(f"🛑 [PAPER SL] Closed ${symbol} ({mint[:6]}...) at {pnl_pct*100:.2f}%.")
                         stopped_out_tokens[mint] = time.time()
                         mints_to_close.append(mint)
 
@@ -304,11 +329,18 @@ def run_trading_loop():
     while True:
         try:
             if len(active_positions) >= MAX_CONCURRENT_POSITIONS:
-                time.sleep(30)
+                time.sleep(15)
                 continue
 
-            print(f"🔎 [SCANNING] Screening organic Solana volume... (Active Positions: {len(active_positions)})")
+            print(f"\n🔎 [SCANNING] Screening organic Solana volume... (Active Positions: {len(active_positions)})")
             mints = fetch_organic_candidates()
+
+            if not mints:
+                print("⚠️ [SCRAPER] No candidates found this cycle. Retrying in 10s...")
+                time.sleep(10)
+                continue
+
+            print(f"⚙️ [EVALUATING] Processing {len(mints)} candidates through security & Markov filters...")
 
             for mint in mints:
                 if len(active_positions) >= MAX_CONCURRENT_POSITIONS:
@@ -323,6 +355,9 @@ def run_trading_loop():
                     else:
                         del stopped_out_tokens[mint]
 
+                # Delay per evaluation to prevent DexScreener API 429 rate limiting
+                time.sleep(0.2)
+
                 pair = get_dex_pair_data(mint)
                 if not pair:
                     continue
@@ -333,27 +368,27 @@ def run_trading_loop():
 
                 # Security Checks: RugCheck + GMGN Bundlers
                 if not check_rugcheck_safety(mint):
-                    print(f"⚠️ [REJECTED] ${symbol} ({mint}) | Failed RugCheck")
+                    print(f"⚠️ [REJECTED] ${symbol} ({mint[:6]}...) | Failed RugCheck")
                     continue
 
                 if not check_gmgn_security(mint):
                     continue
 
                 S = compute_markov_differential(pair)
-                print(f"📊 [EVALUATING] ${symbol} ({mint}) | MC: ${mc:,.0f} | Stride S: {S}")
+                print(f"📊 [PASSED FILTERS] ${symbol} ({mint[:6]}...) | MC: ${mc:,.0f} | Stride S: {S}")
 
                 if S is not None and S >= SIGNAL_THRESHOLD:
-                    print(f"\n[ORGANIC SIGNAL TRIGGERED] ${symbol} | CA: {mint} | MC: ${mc:,.0f} | Stride Signal S = +{S}")
+                    print(f"\n🚀 [SIGNAL TRIGGERED] ${symbol} | CA: {mint} | MC: ${mc:,.0f} | Stride S = +{S}")
                     
                     if PAPER_TRADING:
                         active_positions[mint] = {
                             "symbol": symbol,
                             "entry_price": current_price
                         }
-                        print(f"[PAPER TRADE] Simulated BUY: {SOL_TRADE_SIZE} SOL into ${symbol} | CA: {mint} @ ${current_price:.8f}")
+                        print(f"🟢 [PAPER ENTRY] Simulated BUY: {SOL_TRADE_SIZE} SOL into ${symbol} @ ${current_price:.8f}")
                         break
 
-            time.sleep(30)
+            time.sleep(15)
             
         except Exception as e:
             print(f"[LOOP ERROR] {e}")
