@@ -258,6 +258,7 @@ def run_trading_loop():
                 continue
 
             # 3. Poll DexScreener top trending tokens
+            print(f"🔎 [SCANNING] Checking top boosted tokens... (Active Positions: {len(active_positions)})")
             boost_url = "https://api.dexscreener.com/token-boosts/top/v1"
             res = requests.get(boost_url, timeout=10)
             
@@ -288,16 +289,20 @@ def run_trading_loop():
 
                 pair = get_dex_pair_data(mint)
                 if not pair:
-                    continue
-
-                # RugCheck Safety Gate
-                if not check_rugcheck_safety(mint):
+                    # Token failed Market Cap ($10k-$250k), Liquidity, or 5m Volume checks
                     continue
 
                 symbol = pair.get('baseToken', {}).get('symbol', 'UNKNOWN')
                 current_price = float(pair.get('priceUsd', 0) or 0)
                 mc = pair.get('marketCap') or pair.get('fdv', 0)
+
+                # RugCheck Safety Gate
+                if not check_rugcheck_safety(mint):
+                    print(f"⚠️ [REJECTED] ${symbol} ({mint}) | Failed RugCheck")
+                    continue
+
                 S = compute_markov_differential(pair)
+                print(f"📊 [EVALUATING] ${symbol} ({mint}) | MC: ${mc:,.0f} | Stride S: {S}")
 
                 if S is not None and S >= SIGNAL_THRESHOLD:
                     print(f"\n[SIGNAL TRIGGERED] ${symbol} | CA: {mint} | MC: ${mc:,.0f} | Stride Signal S = +{S}")
