@@ -5,23 +5,10 @@ import threading
 from flask import Flask
 
 # =====================================================================
-# FLASK HEALTH CHECK SERVER (Keeps Render Free Instance Active)
-# =====================================================================
-app = Flask(__name__)
-
-@app.route('/')
-def health_check():
-    return "Markov 2.0 Engine Active", 200
-
-def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
-
-# =====================================================================
 # CONFIGURATION & STATE TRACKING
 # =====================================================================
 PAPER_TRADING = True  # Set to False when ready for live SOL execution
-SOL_TRADE_SIZE = 0.03 # Paper trade size in SOL (Use 0.1 SOL for live)
+SOL_TRADE_SIZE = 0.1  # Paper trade size in SOL
 MIN_LIQUIDITY_USD = 3000.0
 
 # Market Cap Filters
@@ -56,12 +43,12 @@ trade_stats = {
 }
 
 # =====================================================================
-# ORGANIC CANDIDATE SCRAPER (MULTI-QUERY DEX + PROFILES + JUPITER)
+# MULTI-SOURCE ORGANIC CANDIDATE SCRAPER (DEX + PROFILES + JUPITER)
 # =====================================================================
 def fetch_organic_candidates():
     """
-    Fetches active Solana token mints across multiple DexScreener search terms
-    and fallback endpoints to ensure the scanner always has candidates to evaluate.
+    Fetches active Solana token mints across DexScreener search terms,
+    recent profile updates, and Jupiter endpoints.
     """
     candidate_mints = []
 
@@ -97,7 +84,7 @@ def fetch_organic_candidates():
     except Exception:
         pass
 
-    # Source C: Fallback to Jupiter's Public Token API if candidates list is thin
+    # Source C: Fallback to Jupiter API if candidate list is thin
     if len(candidate_mints) < 10:
         try:
             jup_url = "https://tokens.jup.ag/tokens?tags=verified"
@@ -115,21 +102,40 @@ def fetch_organic_candidates():
     return candidate_mints[:30]
 
 # =====================================================================
-# SAFETY & ORGANIC MOMENTUM FILTERS
+# GMGN & RUGCHECK SECURITY GUARDS
 # =====================================================================
+def check_gmgn_security(token_mint):
+    """Checks GMGN endpoint for hidden risks (Bundlers > 10%, high rug ratio)."""
+    try:
+        url = f"https://gmgn.ai/defi/quotation/v1/tokens/sol/{token_mint}"
+        res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+        if res.status_code == 200:
+            data = res.json().get('data', {}).get('token', {})
+            bundler_pct = float(data.get('bundler_pct', 0) or 0)
+            rug_ratio = float(data.get('rug_ratio', 0) or 0)
+            
+            if bundler_pct > 10.0:
+                print(f"⚠️ [GMGN REJECT] {token_mint} | Bundler Cluster High: {bundler_pct:.1f}%")
+                return False
+                
+            if rug_ratio > 0.30:
+                print(f"⚠️ [GMGN REJECT] {token_mint} | High Rug Risk Score: {rug_ratio:.2f}")
+                return False
+                
+            return True
+    except Exception:
+        return True
+
 def check_rugcheck_safety(token_mint):
-    """Queries RugCheck API for mint/freeze risks and high holder concentration."""
+    """Queries RugCheck API for mint/freeze risks and holder concentration."""
     try:
         url = f"https://api.rugcheck.xyz/v1/tokens/{token_mint}/report/summary"
         res = requests.get(url, timeout=5)
-        
         if res.status_code == 200:
             data = res.json()
             risk_level = data.get('riskLevel', '')
-            
             if risk_level in ['Danger', 'High']:
                 return False
-
             risks = data.get('risks', [])
             for risk in risks:
                 risk_name = risk.get('name', '')
@@ -139,6 +145,9 @@ def check_rugcheck_safety(token_mint):
     except Exception:
         return True
 
+# =====================================================================
+# DEX PAIR DATA & MARKOV DIFFERENTIAL
+# =====================================================================
 def get_dex_pair_data(token_mint):
     """Enforces Organic Volume Ratio, Market Cap ($10k-$250k), and Anti-Falling-Knife filters."""
     try:
@@ -155,33 +164,26 @@ def get_dex_pair_data(token_mint):
         pair = pairs[0]
         liquidity = pair.get('liquidity', {}).get('usd', 0)
         
-        # Rule 1: Liquidity Floor Check
         if liquidity < MIN_LIQUIDITY_USD:
             return None
 
-        # Rule 2: Market Cap Gate ($10k min, $250k max)
         mc = pair.get('marketCap') or pair.get('fdv', 0)
         if mc < MIN_MARKET_CAP or mc > MAX_MARKET_CAP:
             return None
 
-        # Rule 3: 5-Minute Volume Floor ($500+)
         v5m = pair.get('volume', {}).get('m5', 0) or 0
         if v5m < MIN_5M_VOLUME:
             return None
 
-        # Rule 4: Macro Downtrend Gate (Reject Falling Knives)
         price_change = pair.get('priceChange', {})
         h6 = price_change.get('h6', 0) or 0
         h24 = price_change.get('h24', 0) or 0
-
         if h6 < MAX_MACRO_DRAWDOWN or h24 < MAX_MACRO_DRAWDOWN:
             return None
 
-        # Rule 5: Organic Buyer Velocity Gate (Buys must lead Sells)
         txns = pair.get('txns', {}).get('m5', {})
         buys = txns.get('buys', 0)
         sells = txns.get('sells', 0)
-
         if (buys + sells) < 12 or buys < (sells * 1.2):
             return None
             
@@ -189,22 +191,6 @@ def get_dex_pair_data(token_mint):
     except Exception:
         return None
 
-def get_raw_price(token_mint):
-    """Fetches purely the USD price for position management."""
-    try:
-        url = f"https://api.dexscreener.com/latest/dex/tokens/{token_mint}"
-        res = requests.get(url, timeout=5)
-        if res.status_code == 200:
-            pairs = res.json().get('pairs', [])
-            if pairs:
-                return float(pairs[0].get('priceUsd', 0) or 0)
-        return None
-    except Exception:
-        return None
-
-# =====================================================================
-# MARKOV 2.0 DIFFERENTIAL ENGINE
-# =====================================================================
 def compute_markov_differential(pair):
     """Evaluates velocity acceleration and volume weighting."""
     price_change = pair.get('priceChange', {})
@@ -223,86 +209,91 @@ def compute_markov_differential(pair):
     stability = 1.0 if abs(v_h1 - v_h6) < 0.5 else 0.5
 
     S = (delta_v * 0.6) + (v_m5 * 0.4) * stability
-
-    # Volume-Weighting Factor
     v5m = pair.get('volume', {}).get('m5', 0) or 0
     volume_weight = min(max(v5m / 1000.0, 0.5), 1.5)
 
     return round(S * volume_weight, 2)
 
-def post_to_familiars(content):
-    """Publishes agent callouts directly to familiars.family public feed."""
-    if not FAMILIARS_API_KEY:
-        return
-
-    url = f"{BASE_FAMILIARS_URL}/api/posts"
-    headers = {
-        "Authorization": f"Bearer {FAMILIARS_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    payload = {"content": content}
-
+# =====================================================================
+# JUPITER REAL-TIME PRICE FEED (V2) & 1-SECOND MONITOR THREAD
+# =====================================================================
+def get_realtime_price(token_mint):
+    """Fetches real-time execution price directly from Jupiter API v2."""
     try:
-        requests.post(url, json=payload, headers=headers, timeout=10)
+        url = f"https://api.jup.ag/price/v2?ids={token_mint}"
+        res = requests.get(url, timeout=2)
+        if res.status_code == 200:
+            data = res.json().get('data', {}).get(token_mint, {})
+            price = data.get('price')
+            if price:
+                return float(price)
     except Exception:
         pass
-
-# =====================================================================
-# POSITION MANAGEMENT & METRICS TRACKER
-# =====================================================================
-def check_active_positions():
-    """Monitors open positions for Take Profit (+35%) or Stop Loss (-12%)."""
-    global active_positions, stopped_out_tokens, trade_stats
     
-    if not active_positions:
-        return
+    # Fallback to DexScreener
+    try:
+        res = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_mint}", timeout=3)
+        if res.status_code == 200:
+            pairs = res.json().get('pairs', [])
+            if pairs:
+                return float(pairs[0].get('priceUsd', 0) or 0)
+    except Exception:
+        pass
+    return None
 
-    mints_to_close = []
+def run_position_monitor():
+    """Dedicated 1-second background thread for instant TP/SL execution."""
+    global active_positions, stopped_out_tokens, trade_stats
+    print("⚡ [THREAD START] Jupiter Real-Time Position Monitor Active (1s Interval)...")
+    
+    while True:
+        try:
+            if active_positions:
+                mints_to_close = []
+                
+                for mint, info in list(active_positions.items()):
+                    symbol = info['symbol']
+                    entry_price = info['entry_price']
+                    
+                    current_price = get_realtime_price(mint)
+                    if not current_price or entry_price == 0:
+                        continue
 
-    for mint, info in active_positions.items():
-        symbol = info['symbol']
-        entry_price = info['entry_price']
-        
-        current_price = get_raw_price(mint)
-        
-        if not current_price or entry_price == 0:
-            print(f"⏳ [MONITOR] Watching ${symbol} | CA: {mint} | Awaiting price feed...")
-            continue
+                    pnl_pct = (current_price - entry_price) / entry_price
 
-        pnl_pct = (current_price - entry_price) / entry_price
-        print(f"📈 [POSITION CHECK] ${symbol} | CA: {mint} | Current: ${current_price:.8f} | Entry: ${entry_price:.8f} | PnL: {pnl_pct*100:+.2f}%")
+                    # 1. TAKE PROFIT (+35%)
+                    if pnl_pct >= TAKE_PROFIT_PCT:
+                        sol_gained = SOL_TRADE_SIZE * pnl_pct
+                        trade_stats["total_closed"] += 1
+                        trade_stats["wins"] += 1
+                        trade_stats["net_sol_pnl"] += sol_gained
+                        win_rate = (trade_stats["wins"] / trade_stats["total_closed"]) * 100
 
-        # 1. Take Profit (+35%)
-        if pnl_pct >= TAKE_PROFIT_PCT:
-            sol_gained = SOL_TRADE_SIZE * pnl_pct
-            trade_stats["total_closed"] += 1
-            trade_stats["wins"] += 1
-            trade_stats["net_sol_pnl"] += sol_gained
-            win_rate = (trade_stats["wins"] / trade_stats["total_closed"]) * 100
+                        print(f"\n🎯 [TAKE PROFIT HIT] ${symbol} | Gain: +{pnl_pct*100:.2f}% (+{sol_gained:.4f} SOL)")
+                        print(f"📊 [STATS] Closed: {trade_stats['total_closed']} | WR: {win_rate:.1f}% | Net PnL: {trade_stats['net_sol_pnl']:+.4f} SOL")
+                        mints_to_close.append(mint)
 
-            print(f"\n🎯 [TAKE PROFIT HIT] ${symbol} | CA: {mint} | Gain: +{pnl_pct*100:.2f}% (+{sol_gained:.4f} SOL)")
-            print(f"📊 [STATS UPDATE] Closed: {trade_stats['total_closed']} | Win Rate: {win_rate:.1f}% | Net SOL: {trade_stats['net_sol_pnl']:+.4f} SOL")
-            
-            post_to_familiars(f"🎉 [PAPER TP] Closed ${symbol} ({mint}) at +{pnl_pct*100:.2f}%! Win Rate: {win_rate:.1f}%")
-            mints_to_close.append((mint, "TP"))
+                    # 2. STOP LOSS (-12%)
+                    elif pnl_pct <= -STOP_LOSS_PCT:
+                        sol_lost = SOL_TRADE_SIZE * pnl_pct
+                        trade_stats["total_closed"] += 1
+                        trade_stats["losses"] += 1
+                        trade_stats["net_sol_pnl"] += sol_lost
+                        win_rate = (trade_stats["wins"] / trade_stats["total_closed"]) * 100
 
-        # 2. Stop Loss (-12%)
-        elif pnl_pct <= -STOP_LOSS_PCT:
-            sol_lost = SOL_TRADE_SIZE * pnl_pct
-            trade_stats["total_closed"] += 1
-            trade_stats["losses"] += 1
-            trade_stats["net_sol_pnl"] += sol_lost
-            win_rate = (trade_stats["wins"] / trade_stats["total_closed"]) * 100
+                        print(f"\n🛑 [STOP LOSS HIT] ${symbol} | Loss: {pnl_pct*100:.2f}% ({sol_lost:.4f} SOL)")
+                        print(f"📊 [STATS] Closed: {trade_stats['total_closed']} | WR: {win_rate:.1f}% | Net PnL: {trade_stats['net_sol_pnl']:+.4f} SOL")
+                        stopped_out_tokens[mint] = time.time()
+                        mints_to_close.append(mint)
 
-            print(f"\n🛑 [STOP LOSS HIT] ${symbol} | CA: {mint} | Loss: {pnl_pct*100:.2f}% ({sol_lost:.4f} SOL)")
-            print(f"📊 [STATS UPDATE] Closed: {trade_stats['total_closed']} | Win Rate: {win_rate:.1f}% | Net SOL: {trade_stats['net_sol_pnl']:+.4f} SOL")
-            
-            post_to_familiars(f"🛑 [PAPER SL] Closed ${symbol} ({mint}) at {pnl_pct*100:.2f}%. Win Rate: {win_rate:.1f}%")
-            stopped_out_tokens[mint] = time.time()
-            mints_to_close.append((mint, "SL"))
+                for mint in mints_to_close:
+                    if mint in active_positions:
+                        del active_positions[mint]
 
-    for mint, exit_type in mints_to_close:
-        del active_positions[mint]
+            time.sleep(1)
+        except Exception as e:
+            print(f"[MONITOR ERROR] {e}")
+            time.sleep(1)
 
 # =====================================================================
 # MAIN CONTINUOUS SCANNING LOOP
@@ -312,8 +303,6 @@ def run_trading_loop():
     
     while True:
         try:
-            check_active_positions()
-
             if len(active_positions) >= MAX_CONCURRENT_POSITIONS:
                 time.sleep(30)
                 continue
@@ -342,8 +331,12 @@ def run_trading_loop():
                 current_price = float(pair.get('priceUsd', 0) or 0)
                 mc = pair.get('marketCap') or pair.get('fdv', 0)
 
+                # Security Checks: RugCheck + GMGN Bundlers
                 if not check_rugcheck_safety(mint):
                     print(f"⚠️ [REJECTED] ${symbol} ({mint}) | Failed RugCheck")
+                    continue
+
+                if not check_gmgn_security(mint):
                     continue
 
                 S = compute_markov_differential(pair)
@@ -358,7 +351,6 @@ def run_trading_loop():
                             "entry_price": current_price
                         }
                         print(f"[PAPER TRADE] Simulated BUY: {SOL_TRADE_SIZE} SOL into ${symbol} | CA: {mint} @ ${current_price:.8f}")
-                        post_to_familiars(f"🎯 [PAPER BUY] Markov 2.0 entered ${symbol} (CA: {mint}) | MC: ${mc:,.0f} | Signal S: +{S}")
                         break
 
             time.sleep(30)
@@ -367,9 +359,24 @@ def run_trading_loop():
             print(f"[LOOP ERROR] {e}")
             time.sleep(10)
 
+# =====================================================================
+# FLASK SERVER & MAIN EXECUTION
+# =====================================================================
+app = Flask(__name__)
+
+@app.route('/')
+def health_check():
+    return "Markov 2.0 Engine Active", 200
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+
 if __name__ == "__main__":
-    flask_thread = threading.Thread(target=run_flask)
-    flask_thread.daemon = True
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
+
+    monitor_thread = threading.Thread(target=run_position_monitor, daemon=True)
+    monitor_thread.start()
 
     run_trading_loop()
