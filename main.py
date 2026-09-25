@@ -29,7 +29,7 @@ MIN_MARKET_CAP = 10000.0   # $10k min market cap
 MAX_MARKET_CAP = 250000.0  # $250k max market cap
 
 # Volume & Trend Safety Filters
-MIN_5M_VOLUME = 500.0      # Minimum $500 in 5m volume to prevent phantom spikes
+MIN_5M_VOLUME = 500.0      # Minimum $500 in 5m volume
 MAX_MACRO_DRAWDOWN = -25.0 # Reject tokens down more than -25% on 6h or 24h
 
 SIGNAL_THRESHOLD = 0.25 # Stride Trigger (S > +0.25)
@@ -56,13 +56,51 @@ trade_stats = {
 }
 
 # =====================================================================
-# SAFETY & ANTI-BUNDLE FILTERS (RUGCHECK + DEXSCREENER)
+# ORGANIC CANDIDATE SCRAPER (ORGANIC TRENDING vs BOOSTED)
+# =====================================================================
+def fetch_organic_candidates():
+    """
+    Fetches tokens with active organic momentum from recent profile updates
+    and direct Solana DEX searches rather than paid boost lists.
+    """
+    candidate_mints = []
+
+    # Source A: DEX Search for active Solana trading pairs
+    try:
+        search_url = "https://api.dexscreener.com/latest/dex/search?q=SOL"
+        res = requests.get(search_url, timeout=8)
+        if res.status_code == 200:
+            pairs = res.json().get('pairs', [])
+            for p in pairs:
+                if p.get('chainId') == 'solana':
+                    base_mint = p.get('baseToken', {}).get('address')
+                    if base_mint and base_mint not in candidate_mints:
+                        candidate_mints.append(base_mint)
+    except Exception:
+        pass
+
+    # Source B: Token Profiles (Recent Organic Activity Updates)
+    try:
+        profile_url = "https://api.dexscreener.com/token-profiles/recent-updates/v1"
+        res = requests.get(profile_url, timeout=8)
+        if res.status_code == 200:
+            profiles = res.json()
+            if isinstance(profiles, list):
+                for item in profiles:
+                    if item.get('chainId') == 'solana':
+                        addr = item.get('tokenAddress')
+                        if addr and addr not in candidate_mints:
+                            candidate_mints.append(addr)
+    except Exception:
+        pass
+
+    return candidate_mints[:25]  # Process top candidates
+
+# =====================================================================
+# SAFETY & ORGANIC MOMENTUM FILTERS
 # =====================================================================
 def check_rugcheck_safety(token_mint):
-    """
-    Queries RugCheck API to detect top-holder supply bundling,
-    unrenounced mint/freeze authorities, or extreme risks.
-    """
+    """Queries RugCheck API for mint/freeze risks and high holder concentration."""
     try:
         url = f"https://api.rugcheck.xyz/v1/tokens/{token_mint}/report/summary"
         res = requests.get(url, timeout=5)
@@ -72,21 +110,19 @@ def check_rugcheck_safety(token_mint):
             risk_level = data.get('riskLevel', '')
             
             if risk_level in ['Danger', 'High']:
-                print(f"[RUGCHECK REFUSAL] Rejected {token_mint} | Risk Level: {risk_level}")
                 return False
 
             risks = data.get('risks', [])
             for risk in risks:
                 risk_name = risk.get('name', '')
                 if risk_name in ['Single holder ownership', 'High holder concentration', 'Mint Authority Enabled', 'Freeze Authority Enabled']:
-                    print(f"[RUGCHECK REFUSAL] Rejected {token_mint} | Flagged: {risk_name}")
                     return False
         return True
     except Exception:
         return True
 
 def get_dex_pair_data(token_mint):
-    """Fetch entry candidates, enforce MC ($10k-$250k), Volume ($500+), and Macro Trends."""
+    """Enforces Organic Volume Ratio, Market Cap ($10k-$250k), and Anti-Falling-Knife filters."""
     try:
         url = f"https://api.dexscreener.com/latest/dex/tokens/{token_mint}"
         res = requests.get(url, timeout=10)
@@ -105,12 +141,12 @@ def get_dex_pair_data(token_mint):
         if liquidity < MIN_LIQUIDITY_USD:
             return None
 
-        # Rule 2: Market Cap Filter ($10k min, $250k max)
+        # Rule 2: Market Cap Gate ($10k min, $250k max)
         mc = pair.get('marketCap') or pair.get('fdv', 0)
         if mc < MIN_MARKET_CAP or mc > MAX_MARKET_CAP:
             return None
 
-        # Rule 3: 5-Minute Volume Floor Filter ($500+)
+        # Rule 3: 5-Minute Volume Floor ($500+)
         v5m = pair.get('volume', {}).get('m5', 0) or 0
         if v5m < MIN_5M_VOLUME:
             return None
@@ -123,15 +159,12 @@ def get_dex_pair_data(token_mint):
         if h6 < MAX_MACRO_DRAWDOWN or h24 < MAX_MACRO_DRAWDOWN:
             return None
 
-        # Rule 5: Transaction Count / Buy-Sell Ratio Gate
+        # Rule 5: Organic Buyer Velocity Gate (Buys must lead Sells)
         txns = pair.get('txns', {}).get('m5', {})
         buys = txns.get('buys', 0)
         sells = txns.get('sells', 0)
 
-        if (buys + sells) < 12:
-            return None
-
-        if sells > (buys * 1.5):
+        if (buys + sells) < 12 or buys < (sells * 1.2):
             return None
             
         return pair
@@ -139,7 +172,7 @@ def get_dex_pair_data(token_mint):
         return None
 
 def get_raw_price(token_mint):
-    """Fetches purely the USD price for open position monitoring without filtering."""
+    """Fetches purely the USD price for position management."""
     try:
         url = f"https://api.dexscreener.com/latest/dex/tokens/{token_mint}"
         res = requests.get(url, timeout=5)
@@ -155,14 +188,13 @@ def get_raw_price(token_mint):
 # MARKOV 2.0 DIFFERENTIAL ENGINE
 # =====================================================================
 def compute_markov_differential(pair):
-    """Evaluates velocity, momentum delta, and volume-weighted stability."""
+    """Evaluates velocity acceleration and volume weighting."""
     price_change = pair.get('priceChange', {})
     m5 = price_change.get('m5', 0) or 0
     h1 = price_change.get('h1', 0) or 0
     h6 = price_change.get('h6', 0) or 0
 
-    # Rule 6: Anti-Top-Blast Refusal
-    if h1 > 50.0 or m5 > 30.0:
+    if h1 > 50.0 or m5 > 30.0:  # Anti-Top-Blast Refusal
         return None
 
     v_m5 = m5 / 5.0
@@ -172,15 +204,13 @@ def compute_markov_differential(pair):
     v_h6 = h6 / 360.0
     stability = 1.0 if abs(v_h1 - v_h6) < 0.5 else 0.5
 
-    # Base Differential Signal
     S = (delta_v * 0.6) + (v_m5 * 0.4) * stability
 
-    # Volume-Weighting Factor (Scales up with higher 5m volume relative to $1k baseline)
+    # Volume-Weighting Factor
     v5m = pair.get('volume', {}).get('m5', 0) or 0
     volume_weight = min(max(v5m / 1000.0, 0.5), 1.5)
 
-    S_weighted = S * volume_weight
-    return round(S_weighted, 2)
+    return round(S * volume_weight, 2)
 
 def post_to_familiars(content):
     """Publishes agent callouts directly to familiars.family public feed."""
@@ -218,47 +248,38 @@ def check_active_positions():
         current_price = get_raw_price(mint)
         
         if not current_price or entry_price == 0:
-            print(f"⏳ [MONITOR] Watching ${symbol} | CA: {mint} | Awaiting raw price feed...")
+            print(f"⏳ [MONITOR] Watching ${symbol} | CA: {mint} | Awaiting price feed...")
             continue
 
         pnl_pct = (current_price - entry_price) / entry_price
         print(f"📈 [POSITION CHECK] ${symbol} | CA: {mint} | Current: ${current_price:.8f} | Entry: ${entry_price:.8f} | PnL: {pnl_pct*100:+.2f}%")
 
-        # 1. Take Profit Trigger (+35%)
+        # 1. Take Profit (+35%)
         if pnl_pct >= TAKE_PROFIT_PCT:
             sol_gained = SOL_TRADE_SIZE * pnl_pct
             trade_stats["total_closed"] += 1
             trade_stats["wins"] += 1
             trade_stats["net_sol_pnl"] += sol_gained
-            
             win_rate = (trade_stats["wins"] / trade_stats["total_closed"]) * 100
 
             print(f"\n🎯 [TAKE PROFIT HIT] ${symbol} | CA: {mint} | Gain: +{pnl_pct*100:.2f}% (+{sol_gained:.4f} SOL)")
             print(f"📊 [STATS UPDATE] Closed: {trade_stats['total_closed']} | Win Rate: {win_rate:.1f}% | Net SOL: {trade_stats['net_sol_pnl']:+.4f} SOL")
             
-            post_to_familiars(
-                f"🎉 [PAPER TP] Closed ${symbol} ({mint}) at +{pnl_pct*100:.2f}%! "
-                f"Win Rate: {win_rate:.1f}% ({trade_stats['net_sol_pnl']:+.4f} SOL total)"
-            )
+            post_to_familiars(f"🎉 [PAPER TP] Closed ${symbol} ({mint}) at +{pnl_pct*100:.2f}%! Win Rate: {win_rate:.1f}%")
             mints_to_close.append((mint, "TP"))
 
-        # 2. Stop Loss Trigger (-12%)
+        # 2. Stop Loss (-12%)
         elif pnl_pct <= -STOP_LOSS_PCT:
             sol_lost = SOL_TRADE_SIZE * pnl_pct
             trade_stats["total_closed"] += 1
             trade_stats["losses"] += 1
             trade_stats["net_sol_pnl"] += sol_lost
-            
             win_rate = (trade_stats["wins"] / trade_stats["total_closed"]) * 100
 
             print(f"\n🛑 [STOP LOSS HIT] ${symbol} | CA: {mint} | Loss: {pnl_pct*100:.2f}% ({sol_lost:.4f} SOL)")
             print(f"📊 [STATS UPDATE] Closed: {trade_stats['total_closed']} | Win Rate: {win_rate:.1f}% | Net SOL: {trade_stats['net_sol_pnl']:+.4f} SOL")
             
-            post_to_familiars(
-                f"🛑 [PAPER SL] Closed ${symbol} ({mint}) at {pnl_pct*100:.2f}%. "
-                f"Win Rate: {win_rate:.1f}% ({trade_stats['net_sol_pnl']:+.4f} SOL total)"
-            )
-            
+            post_to_familiars(f"🛑 [PAPER SL] Closed ${symbol} ({mint}) at {pnl_pct*100:.2f}%. Win Rate: {win_rate:.1f}%")
             stopped_out_tokens[mint] = time.time()
             mints_to_close.append((mint, "SL"))
 
@@ -269,58 +290,40 @@ def check_active_positions():
 # MAIN CONTINUOUS SCANNING LOOP
 # =====================================================================
 def run_trading_loop():
-    print(f"--- Markov 2.0 Engine Starting (Paper Mode: {PAPER_TRADING}) ---")
+    print(f"--- Markov 2.0 Engine Active (Organic Mode | Paper: {PAPER_TRADING}) ---")
     
     while True:
         try:
-            # 1. Update open position status
             check_active_positions()
 
-            # 2. Single Position Enforcement
             if len(active_positions) >= MAX_CONCURRENT_POSITIONS:
                 time.sleep(30)
                 continue
 
-            # 3. Poll DexScreener top trending tokens
-            print(f"🔎 [SCANNING] Checking top boosted tokens... (Active Positions: {len(active_positions)})")
-            boost_url = "https://api.dexscreener.com/token-boosts/top/v1"
-            res = requests.get(boost_url, timeout=10)
-            
-            if res.status_code == 200:
-                data = res.json()
-                tokens = data[:15] if isinstance(data, list) else []
-            else:
-                tokens = []
+            print(f"🔎 [SCANNING] Screening organic Solana volume... (Active Positions: {len(active_positions)})")
+            mints = fetch_organic_candidates()
 
-            for item in tokens:
+            for mint in mints:
                 if len(active_positions) >= MAX_CONCURRENT_POSITIONS:
                     break
-
-                mint = item.get('tokenAddress')
-                if not mint:
-                    continue
 
                 if mint in active_positions:
                     continue
 
-                # 2-Hour Cooldown Gate
                 if mint in stopped_out_tokens:
-                    time_since_sl = time.time() - stopped_out_tokens[mint]
-                    if time_since_sl < BLACKLIST_COOLDOWN_SEC:
+                    if time.time() - stopped_out_tokens[mint] < BLACKLIST_COOLDOWN_SEC:
                         continue
                     else:
                         del stopped_out_tokens[mint]
 
                 pair = get_dex_pair_data(mint)
                 if not pair:
-                    # Token failed MC ($10k-$250k), $500 5m Volume, Liquidity, or Macro Drawdown checks
                     continue
 
                 symbol = pair.get('baseToken', {}).get('symbol', 'UNKNOWN')
                 current_price = float(pair.get('priceUsd', 0) or 0)
                 mc = pair.get('marketCap') or pair.get('fdv', 0)
 
-                # RugCheck Safety Gate
                 if not check_rugcheck_safety(mint):
                     print(f"⚠️ [REJECTED] ${symbol} ({mint}) | Failed RugCheck")
                     continue
@@ -329,7 +332,7 @@ def run_trading_loop():
                 print(f"📊 [EVALUATING] ${symbol} ({mint}) | MC: ${mc:,.0f} | Stride S: {S}")
 
                 if S is not None and S >= SIGNAL_THRESHOLD:
-                    print(f"\n[SIGNAL TRIGGERED] ${symbol} | CA: {mint} | MC: ${mc:,.0f} | Stride Signal S = +{S}")
+                    print(f"\n[ORGANIC SIGNAL TRIGGERED] ${symbol} | CA: {mint} | MC: ${mc:,.0f} | Stride Signal S = +{S}")
                     
                     if PAPER_TRADING:
                         active_positions[mint] = {
@@ -337,8 +340,6 @@ def run_trading_loop():
                             "entry_price": current_price
                         }
                         print(f"[PAPER TRADE] Simulated BUY: {SOL_TRADE_SIZE} SOL into ${symbol} | CA: {mint} @ ${current_price:.8f}")
-                        print(f"[STATE] Active Position: ${symbol} | CA: {mint} | Monitoring price feed every 30s...")
-                        
                         post_to_familiars(f"🎯 [PAPER BUY] Markov 2.0 entered ${symbol} (CA: {mint}) | MC: ${mc:,.0f} | Signal S: +{S}")
                         break
 
