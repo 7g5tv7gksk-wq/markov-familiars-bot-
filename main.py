@@ -29,7 +29,7 @@ TAKE_PROFIT_PCT = 0.35  # +35% TP
 STOP_LOSS_PCT = 0.12    # -12% SL
 BLACKLIST_COOLDOWN_SEC = 7200  # 2-hour cooldown after Stop Loss
 
-MAX_CONCURRENT_POSITIONS = 1   # Single position limit for testing
+MAX_CONCURRENT_POSITIONS = 1   # Single position limit for overnight test
 
 FAMILIARS_API_KEY = os.environ.get("FAMILIARS_API_KEY", "")
 BASE_FAMILIARS_URL = "https://familiars.family"
@@ -47,10 +47,40 @@ trade_stats = {
 }
 
 # =====================================================================
-# MARKOV 2.0 DIFFERENTIAL ENGINE
+# SAFETY & ANTI-BUNDLE FILTERS (RUGCHECK + DEXSCREENER)
 # =====================================================================
+def check_rugcheck_safety(token_mint):
+    """
+    Queries RugCheck API to detect top-holder supply bundling,
+    unrenounced mint/freeze authorities, or extreme risks.
+    """
+    try:
+        url = f"https://api.rugcheck.xyz/v1/tokens/{token_mint}/report/summary"
+        res = requests.get(url, timeout=5)
+        
+        if res.status_code == 200:
+            data = res.json()
+            risk_level = data.get('riskLevel', '')
+            
+            # Reject high risk ratings
+            if risk_level in ['Danger', 'High']:
+                print(f"[RUGCHECK REFUSAL] Rejected {token_mint} | Risk Level: {risk_level}")
+                return False
+
+            risks = data.get('risks', [])
+            for risk in risks:
+                risk_name = risk.get('name', '')
+                # Specifically catch bundled supply or active authorities
+                if risk_name in ['Single holder ownership', 'High holder concentration', 'Mint Authority Enabled', 'Freeze Authority Enabled']:
+                    print(f"[RUGCHECK REFUSAL] Rejected {token_mint} | Flagged: {risk_name}")
+                    return False
+        return True
+    except Exception:
+        # Fallback to keep engine scanning if RugCheck endpoint drops
+        return True
+
 def get_dex_pair_data(token_mint):
-    """Fetch live market data, liquidity, and price metrics from DexScreener."""
+    """Fetch market metrics and check 5-minute transaction health."""
     try:
         url = f"https://api.dexscreener.com/latest/dex/tokens/{token_mint}"
         res = requests.get(url, timeout=10)
@@ -65,13 +95,30 @@ def get_dex_pair_data(token_mint):
         pair = pairs[0]
         liquidity = pair.get('liquidity', {}).get('usd', 0)
         
+        # Rule 1: Liquidity Floor Check
         if liquidity < MIN_LIQUIDITY_USD:
+            return None
+
+        # Rule 2: Transaction Count / Buy-Sell Ratio Gate
+        txns = pair.get('txns', {}).get('m5', {})
+        buys = txns.get('buys', 0)
+        sells = txns.get('sells', 0)
+
+        # Skip if total transactions < 12 (fake volume / insider deadlock)
+        if (buys + sells) < 12:
+            return None
+
+        # Skip if sells outpace buys 1.5x (insider dumping signature)
+        if sells > (buys * 1.5):
             return None
             
         return pair
     except Exception:
         return None
 
+# =====================================================================
+# MARKOV 2.0 DIFFERENTIAL ENGINE
+# =====================================================================
 def compute_markov_differential(pair):
     """Evaluates velocity, momentum delta, and structural stability."""
     price_change = pair.get('priceChange', {})
@@ -79,7 +126,7 @@ def compute_markov_differential(pair):
     h1 = price_change.get('h1', 0) or 0
     h6 = price_change.get('h6', 0) or 0
 
-    # Anti-Top-Blast Refusal
+    # Rule 3: Anti-Top-Blast Refusal
     if h1 > 50.0 or m5 > 30.0:
         return None
 
@@ -150,13 +197,13 @@ def check_active_positions():
             
             post_to_familiars(
                 f"🎉 [PAPER TP] Closed ${symbol} at +{pnl_pct*100:.2f}%! "
-                f"Overall Win Rate: {win_rate:.1f}% ({trade_stats['net_sol_pnl']:+.4f} SOL)"
+                f"Win Rate: {win_rate:.1f}% ({trade_stats['net_sol_pnl']:+.4f} SOL total)"
             )
             mints_to_close.append((mint, "TP"))
 
         # 2. Stop Loss Trigger (-12%)
         elif pnl_pct <= -STOP_LOSS_PCT:
-            sol_lost = SOL_TRADE_SIZE * pnl_pct  # Negative float value
+            sol_lost = SOL_TRADE_SIZE * pnl_pct  # Negative value
             trade_stats["total_closed"] += 1
             trade_stats["losses"] += 1
             trade_stats["net_sol_pnl"] += sol_lost
@@ -168,7 +215,7 @@ def check_active_positions():
             
             post_to_familiars(
                 f"🛑 [PAPER SL] Closed ${symbol} at {pnl_pct*100:.2f}%. "
-                f"Overall Win Rate: {win_rate:.1f}% ({trade_stats['net_sol_pnl']:+.4f} SOL)"
+                f"Win Rate: {win_rate:.1f}% ({trade_stats['net_sol_pnl']:+.4f} SOL total)"
             )
             
             # Place on 2-hour temporary cooldown
@@ -186,16 +233,15 @@ def run_trading_loop():
     
     while True:
         try:
-            # 1. Update open positions (Check TP/SL)
+            # 1. Update open position status
             check_active_positions()
 
-            # 2. Check Single Position Limit Rule
+            # 2. Single Position Enforcement
             if len(active_positions) >= MAX_CONCURRENT_POSITIONS:
-                # Holding 1 active trade -> sleep 30s and re-check position status
                 time.sleep(30)
                 continue
 
-            # 3. Poll DexScreener for candidate entries
+            # 3. Poll DexScreener top trending tokens
             boost_url = "https://api.dexscreener.com/token-boosts/top/v1"
             res = requests.get(boost_url, timeout=10)
             
@@ -206,7 +252,6 @@ def run_trading_loop():
                 tokens = []
 
             for item in tokens:
-                # Double check position count inside processing loop
                 if len(active_positions) >= MAX_CONCURRENT_POSITIONS:
                     break
 
@@ -214,20 +259,23 @@ def run_trading_loop():
                 if not mint:
                     continue
 
-                # GATE 1: Skip if currently open
                 if mint in active_positions:
                     continue
 
-                # GATE 2: Skip if under 2-hour cooldown
+                # 2-Hour Cooldown Gate
                 if mint in stopped_out_tokens:
                     time_since_sl = time.time() - stopped_out_tokens[mint]
                     if time_since_sl < BLACKLIST_COOLDOWN_SEC:
                         continue
                     else:
-                        del stopped_out_tokens[mint] # Cooldown expired
+                        del stopped_out_tokens[mint]
 
                 pair = get_dex_pair_data(mint)
                 if not pair:
+                    continue
+
+                # RugCheck Safety Gate (Holder concentration & bundle check)
+                if not check_rugcheck_safety(mint):
                     continue
 
                 symbol = pair.get('baseToken', {}).get('symbol', 'UNKNOWN')
