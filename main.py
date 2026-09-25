@@ -29,7 +29,7 @@ TAKE_PROFIT_PCT = 0.35  # +35% TP
 STOP_LOSS_PCT = 0.12    # -12% SL
 BLACKLIST_COOLDOWN_SEC = 7200  # 2-hour cooldown after Stop Loss
 
-MAX_CONCURRENT_POSITIONS = 1   # Single position limit for overnight test
+MAX_CONCURRENT_POSITIONS = 1   # Single position limit for testing
 
 FAMILIARS_API_KEY = os.environ.get("FAMILIARS_API_KEY", "")
 BASE_FAMILIARS_URL = "https://familiars.family"
@@ -62,7 +62,6 @@ def check_rugcheck_safety(token_mint):
             data = res.json()
             risk_level = data.get('riskLevel', '')
             
-            # Reject high risk ratings
             if risk_level in ['Danger', 'High']:
                 print(f"[RUGCHECK REFUSAL] Rejected {token_mint} | Risk Level: {risk_level}")
                 return False
@@ -70,17 +69,15 @@ def check_rugcheck_safety(token_mint):
             risks = data.get('risks', [])
             for risk in risks:
                 risk_name = risk.get('name', '')
-                # Specifically catch bundled supply or active authorities
                 if risk_name in ['Single holder ownership', 'High holder concentration', 'Mint Authority Enabled', 'Freeze Authority Enabled']:
                     print(f"[RUGCHECK REFUSAL] Rejected {token_mint} | Flagged: {risk_name}")
                     return False
         return True
     except Exception:
-        # Fallback to keep engine scanning if RugCheck endpoint drops
         return True
 
 def get_dex_pair_data(token_mint):
-    """Fetch market metrics and check 5-minute transaction health."""
+    """Fetch entry candidates and check 5-minute transaction health."""
     try:
         url = f"https://api.dexscreener.com/latest/dex/tokens/{token_mint}"
         res = requests.get(url, timeout=10)
@@ -104,15 +101,26 @@ def get_dex_pair_data(token_mint):
         buys = txns.get('buys', 0)
         sells = txns.get('sells', 0)
 
-        # Skip if total transactions < 12 (fake volume / insider deadlock)
         if (buys + sells) < 12:
             return None
 
-        # Skip if sells outpace buys 1.5x (insider dumping signature)
         if sells > (buys * 1.5):
             return None
             
         return pair
+    except Exception:
+        return None
+
+def get_raw_price(token_mint):
+    """Fetches purely the USD price for open position monitoring without filtering."""
+    try:
+        url = f"https://api.dexscreener.com/latest/dex/tokens/{token_mint}"
+        res = requests.get(url, timeout=5)
+        if res.status_code == 200:
+            pairs = res.json().get('pairs', [])
+            if pairs:
+                return float(pairs[0].get('priceUsd', 0) or 0)
+        return None
     except Exception:
         return None
 
@@ -170,18 +178,17 @@ def check_active_positions():
     mints_to_close = []
 
     for mint, info in active_positions.items():
-        pair = get_dex_pair_data(mint)
-        if not pair:
-            continue
-
-        current_price = float(pair.get('priceUsd', 0) or 0)
-        entry_price = info['entry_price']
         symbol = info['symbol']
-
-        if entry_price == 0 or current_price == 0:
+        entry_price = info['entry_price']
+        
+        current_price = get_raw_price(mint)
+        
+        if not current_price or entry_price == 0:
+            print(f"⏳ [MONITOR] Watching ${symbol} | Awaiting raw price feed...")
             continue
 
         pnl_pct = (current_price - entry_price) / entry_price
+        print(f"📈 [POSITION CHECK] ${symbol} | Current: ${current_price:.8f} | Entry: ${entry_price:.8f} | PnL: {pnl_pct*100:+.2f}%")
 
         # 1. Take Profit Trigger (+35%)
         if pnl_pct >= TAKE_PROFIT_PCT:
@@ -203,7 +210,7 @@ def check_active_positions():
 
         # 2. Stop Loss Trigger (-12%)
         elif pnl_pct <= -STOP_LOSS_PCT:
-            sol_lost = SOL_TRADE_SIZE * pnl_pct  # Negative value
+            sol_lost = SOL_TRADE_SIZE * pnl_pct
             trade_stats["total_closed"] += 1
             trade_stats["losses"] += 1
             trade_stats["net_sol_pnl"] += sol_lost
@@ -218,7 +225,6 @@ def check_active_positions():
                 f"Win Rate: {win_rate:.1f}% ({trade_stats['net_sol_pnl']:+.4f} SOL total)"
             )
             
-            # Place on 2-hour temporary cooldown
             stopped_out_tokens[mint] = time.time()
             mints_to_close.append((mint, "SL"))
 
@@ -233,7 +239,7 @@ def run_trading_loop():
     
     while True:
         try:
-            # 1. Update open position status
+            # 1. Update open position status (using raw price feed)
             check_active_positions()
 
             # 2. Single Position Enforcement
@@ -274,7 +280,7 @@ def run_trading_loop():
                 if not pair:
                     continue
 
-                # RugCheck Safety Gate (Holder concentration & bundle check)
+                # RugCheck Safety Gate
                 if not check_rugcheck_safety(mint):
                     continue
 
@@ -290,8 +296,8 @@ def run_trading_loop():
                             "symbol": symbol,
                             "entry_price": current_price
                         }
-                        print(f"[PAPER TRADE] Simulated BUY: {SOL_TRADE_SIZE} SOL into ${symbol} @ ${current_price}")
-                        print(f"[STATE] Active Position: ${symbol} | Scanning Paused Until Position Exit.")
+                        print(f"[PAPER TRADE] Simulated BUY: {SOL_TRADE_SIZE} SOL into ${symbol} @ ${current_price:.8f}")
+                        print(f"[STATE] Active Position: ${symbol} | Monitoring price feed every 30s...")
                         
                         post_to_familiars(f"🎯 [PAPER BUY] Markov 2.0 entered ${symbol} (Signal S: +{S})")
                         break
