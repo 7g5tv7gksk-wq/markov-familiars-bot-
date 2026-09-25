@@ -28,6 +28,10 @@ MIN_LIQUIDITY_USD = 3000.0
 MIN_MARKET_CAP = 10000.0   # $10k min market cap
 MAX_MARKET_CAP = 250000.0  # $250k max market cap
 
+# Volume & Trend Safety Filters
+MIN_5M_VOLUME = 500.0      # Minimum $500 in 5m volume to prevent phantom spikes
+MAX_MACRO_DRAWDOWN = -25.0 # Reject tokens down more than -25% on 6h or 24h
+
 SIGNAL_THRESHOLD = 0.25 # Stride Trigger (S > +0.25)
 
 TAKE_PROFIT_PCT = 0.35  # +35% TP
@@ -82,7 +86,7 @@ def check_rugcheck_safety(token_mint):
         return True
 
 def get_dex_pair_data(token_mint):
-    """Fetch entry candidates, enforce Market Cap ($10k-$250k), and check 5-min txns."""
+    """Fetch entry candidates, enforce MC ($10k-$250k), Volume ($500+), and Macro Trends."""
     try:
         url = f"https://api.dexscreener.com/latest/dex/tokens/{token_mint}"
         res = requests.get(url, timeout=10)
@@ -106,7 +110,20 @@ def get_dex_pair_data(token_mint):
         if mc < MIN_MARKET_CAP or mc > MAX_MARKET_CAP:
             return None
 
-        # Rule 3: Transaction Count / Buy-Sell Ratio Gate
+        # Rule 3: 5-Minute Volume Floor Filter ($500+)
+        v5m = pair.get('volume', {}).get('m5', 0) or 0
+        if v5m < MIN_5M_VOLUME:
+            return None
+
+        # Rule 4: Macro Downtrend Gate (Reject Falling Knives)
+        price_change = pair.get('priceChange', {})
+        h6 = price_change.get('h6', 0) or 0
+        h24 = price_change.get('h24', 0) or 0
+
+        if h6 < MAX_MACRO_DRAWDOWN or h24 < MAX_MACRO_DRAWDOWN:
+            return None
+
+        # Rule 5: Transaction Count / Buy-Sell Ratio Gate
         txns = pair.get('txns', {}).get('m5', {})
         buys = txns.get('buys', 0)
         sells = txns.get('sells', 0)
@@ -138,13 +155,13 @@ def get_raw_price(token_mint):
 # MARKOV 2.0 DIFFERENTIAL ENGINE
 # =====================================================================
 def compute_markov_differential(pair):
-    """Evaluates velocity, momentum delta, and structural stability."""
+    """Evaluates velocity, momentum delta, and volume-weighted stability."""
     price_change = pair.get('priceChange', {})
     m5 = price_change.get('m5', 0) or 0
     h1 = price_change.get('h1', 0) or 0
     h6 = price_change.get('h6', 0) or 0
 
-    # Rule 4: Anti-Top-Blast Refusal
+    # Rule 6: Anti-Top-Blast Refusal
     if h1 > 50.0 or m5 > 30.0:
         return None
 
@@ -155,8 +172,15 @@ def compute_markov_differential(pair):
     v_h6 = h6 / 360.0
     stability = 1.0 if abs(v_h1 - v_h6) < 0.5 else 0.5
 
+    # Base Differential Signal
     S = (delta_v * 0.6) + (v_m5 * 0.4) * stability
-    return round(S, 2)
+
+    # Volume-Weighting Factor (Scales up with higher 5m volume relative to $1k baseline)
+    v5m = pair.get('volume', {}).get('m5', 0) or 0
+    volume_weight = min(max(v5m / 1000.0, 0.5), 1.5)
+
+    S_weighted = S * volume_weight
+    return round(S_weighted, 2)
 
 def post_to_familiars(content):
     """Publishes agent callouts directly to familiars.family public feed."""
@@ -289,7 +313,7 @@ def run_trading_loop():
 
                 pair = get_dex_pair_data(mint)
                 if not pair:
-                    # Token failed Market Cap ($10k-$250k), Liquidity, or 5m Volume checks
+                    # Token failed MC ($10k-$250k), $500 5m Volume, Liquidity, or Macro Drawdown checks
                     continue
 
                 symbol = pair.get('baseToken', {}).get('symbol', 'UNKNOWN')
