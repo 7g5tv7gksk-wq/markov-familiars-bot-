@@ -43,12 +43,12 @@ trade_stats = {
 }
 
 # =====================================================================
-# MULTI-SOURCE ORGANIC CANDIDATE SCRAPER
+# MULTI-SOURCE ORGANIC CANDIDATE SCRAPER (PACED TO PREVENT 429)
 # =====================================================================
 def fetch_organic_candidates():
     """
     Fetches active Solana token mints across DexScreener search terms,
-    recent profile updates, and Jupiter endpoints.
+    recent profile updates, and Jupiter endpoints with built-in pacing.
     """
     candidate_mints = []
 
@@ -66,8 +66,12 @@ def fetch_organic_candidates():
                             base_mint = p.get('baseToken', {}).get('address')
                             if base_mint and base_mint not in candidate_mints:
                                 candidate_mints.append(base_mint)
+            elif res.status_code == 429:
+                print("⚠️ [SCRAPER RATE LIMIT] Throttled on search term. Backing off...")
+                time.sleep(2)
         except Exception:
             pass
+        time.sleep(0.3)  # Pacing to avoid hitting 429 rate limit
 
     # Source B: Token Profiles (Recent Updates)
     try:
@@ -146,56 +150,73 @@ def check_rugcheck_safety(token_mint):
         return True
 
 # =====================================================================
-# DEX PAIR DATA & MARKOV DIFFERENTIAL
+# BATCH DEX PAIR FETCHING & MARKOV DIFFERENTIAL
 # =====================================================================
-def get_dex_pair_data(token_mint):
-    """Enforces Organic Volume Ratio, Market Cap ($10k-$250k), and Anti-Falling-Knife filters."""
+def get_batch_dex_pairs(token_mints):
+    """
+    Fetches up to 30 token pair profiles in 1 single HTTP request
+    to completely prevent DexScreener rate-limiting.
+    """
+    if not token_mints:
+        return {}
+    
+    mint_csv = ",".join(token_mints[:30])
+    url = f"https://api.dexscreener.com/latest/dex/tokens/{mint_csv}"
+    
     try:
-        url = f"https://api.dexscreener.com/latest/dex/tokens/{token_mint}"
-        res = requests.get(url, timeout=5)
-        
+        res = requests.get(url, timeout=10)
         if res.status_code == 429:
-            print("⚠️ [DEX RATE LIMIT] Throttled by DexScreener. Backing off...")
-            time.sleep(2)
-            return None
-
+            print("⚠️ [DEX BATCH RATE LIMIT] Throttled by DexScreener. Pausing 5s...")
+            time.sleep(5)
+            return {}
+            
         if res.status_code != 200:
-            return None
-        
+            return {}
+
         data = res.json()
         pairs = data.get('pairs', [])
-        if not pairs:
-            return None
         
-        pair = pairs[0]
-        liquidity = float(pair.get('liquidity', {}).get('usd', 0) or 0)
-        mc = float(pair.get('marketCap') or pair.get('fdv', 0) or 0)
-
-        if liquidity < MIN_LIQUIDITY_USD:
-            return None
-
-        if mc < MIN_MARKET_CAP or mc > MAX_MARKET_CAP:
-            return None
-
-        v5m = float(pair.get('volume', {}).get('m5', 0) or 0)
-        if v5m < MIN_5M_VOLUME:
-            return None
-
-        price_change = pair.get('priceChange', {})
-        h6 = float(price_change.get('h6', 0) or 0)
-        h24 = float(price_change.get('h24', 0) or 0)
-        if h6 < MAX_MACRO_DRAWDOWN or h24 < MAX_MACRO_DRAWDOWN:
-            return None
-
-        txns = pair.get('txns', {}).get('m5', {})
-        buys = txns.get('buys', 0)
-        sells = txns.get('sells', 0)
-        if (buys + sells) < 12 or buys < (sells * 1.2):
-            return None
-            
-        return pair
+        # Group highest liquidity pair per base token mint
+        mint_pair_map = {}
+        if pairs:
+            for pair in pairs:
+                if pair.get('chainId') == 'solana':
+                    base_mint = pair.get('baseToken', {}).get('address')
+                    if base_mint and base_mint not in mint_pair_map:
+                        mint_pair_map[base_mint] = pair
+                        
+        return mint_pair_map
     except Exception:
-        return None
+        return {}
+
+def evaluate_pair_safety(pair):
+    """Enforces Organic Volume Ratio, Market Cap ($10k-$250k), and Anti-Falling-Knife filters."""
+    if not pair:
+        return False
+
+    liquidity = float(pair.get('liquidity', {}).get('usd', 0) or 0)
+    mc = float(pair.get('marketCap') or pair.get('fdv', 0) or 0)
+
+    if liquidity < MIN_LIQUIDITY_USD or mc < MIN_MARKET_CAP or mc > MAX_MARKET_CAP:
+        return False
+
+    v5m = float(pair.get('volume', {}).get('m5', 0) or 0)
+    if v5m < MIN_5M_VOLUME:
+        return False
+
+    price_change = pair.get('priceChange', {})
+    h6 = float(price_change.get('h6', 0) or 0)
+    h24 = float(price_change.get('h24', 0) or 0)
+    if h6 < MAX_MACRO_DRAWDOWN or h24 < MAX_MACRO_DRAWDOWN:
+        return False
+
+    txns = pair.get('txns', {}).get('m5', {})
+    buys = txns.get('buys', 0)
+    sells = txns.get('sells', 0)
+    if (buys + sells) < 12 or buys < (sells * 1.2):
+        return False
+
+    return True
 
 def compute_markov_differential(pair):
     """Evaluates velocity acceleration and volume weighting."""
@@ -336,30 +357,26 @@ def run_trading_loop():
             mints = fetch_organic_candidates()
 
             if not mints:
-                print("⚠️ [SCRAPER] No candidates found this cycle. Retrying in 10s...")
+                print("⚠️ [SCRAPER] No candidates returned this cycle. Retrying in 10s...")
                 time.sleep(10)
                 continue
 
-            print(f"⚙️ [EVALUATING] Processing {len(mints)} candidates through security & Markov filters...")
+            # Clean up active/blacklisted mints from batch lookup list
+            eval_mints = [
+                m for m in mints 
+                if m not in active_positions and 
+                (m not in stopped_out_tokens or time.time() - stopped_out_tokens[m] >= BLACKLIST_COOLDOWN_SEC)
+            ]
 
-            for mint in mints:
+            print(f"⚙️ [EVALUATING] Batch fetching {len(eval_mints)} candidates from DexScreener...")
+            pair_map = get_batch_dex_pairs(eval_mints)
+
+            for mint in eval_mints:
                 if len(active_positions) >= MAX_CONCURRENT_POSITIONS:
                     break
 
-                if mint in active_positions:
-                    continue
-
-                if mint in stopped_out_tokens:
-                    if time.time() - stopped_out_tokens[mint] < BLACKLIST_COOLDOWN_SEC:
-                        continue
-                    else:
-                        del stopped_out_tokens[mint]
-
-                # Delay per evaluation to prevent DexScreener API 429 rate limiting
-                time.sleep(0.2)
-
-                pair = get_dex_pair_data(mint)
-                if not pair:
+                pair = pair_map.get(mint)
+                if not pair or not evaluate_pair_safety(pair):
                     continue
 
                 symbol = pair.get('baseToken', {}).get('symbol', 'UNKNOWN')
@@ -415,3 +432,4 @@ if __name__ == "__main__":
     monitor_thread.start()
 
     run_trading_loop()
+l
