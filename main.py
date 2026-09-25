@@ -23,6 +23,11 @@ def run_flask():
 PAPER_TRADING = True  # Set to False when ready for live SOL execution
 SOL_TRADE_SIZE = 0.03 # Paper trade size in SOL
 MIN_LIQUIDITY_USD = 3000.0
+
+# Market Cap Filters
+MIN_MARKET_CAP = 10000.0   # $10k min market cap
+MAX_MARKET_CAP = 250000.0  # $250k max market cap
+
 SIGNAL_THRESHOLD = 0.25 # Stride Trigger (S > +0.25)
 
 TAKE_PROFIT_PCT = 0.35  # +35% TP
@@ -77,7 +82,7 @@ def check_rugcheck_safety(token_mint):
         return True
 
 def get_dex_pair_data(token_mint):
-    """Fetch entry candidates and check 5-minute transaction health."""
+    """Fetch entry candidates, enforce Market Cap ($10k-$250k), and check 5-min txns."""
     try:
         url = f"https://api.dexscreener.com/latest/dex/tokens/{token_mint}"
         res = requests.get(url, timeout=10)
@@ -96,7 +101,12 @@ def get_dex_pair_data(token_mint):
         if liquidity < MIN_LIQUIDITY_USD:
             return None
 
-        # Rule 2: Transaction Count / Buy-Sell Ratio Gate
+        # Rule 2: Market Cap Filter ($10k min, $250k max)
+        mc = pair.get('marketCap') or pair.get('fdv', 0)
+        if mc < MIN_MARKET_CAP or mc > MAX_MARKET_CAP:
+            return None
+
+        # Rule 3: Transaction Count / Buy-Sell Ratio Gate
         txns = pair.get('txns', {}).get('m5', {})
         buys = txns.get('buys', 0)
         sells = txns.get('sells', 0)
@@ -134,7 +144,7 @@ def compute_markov_differential(pair):
     h1 = price_change.get('h1', 0) or 0
     h6 = price_change.get('h6', 0) or 0
 
-    # Rule 3: Anti-Top-Blast Refusal
+    # Rule 4: Anti-Top-Blast Refusal
     if h1 > 50.0 or m5 > 30.0:
         return None
 
@@ -184,11 +194,11 @@ def check_active_positions():
         current_price = get_raw_price(mint)
         
         if not current_price or entry_price == 0:
-            print(f"⏳ [MONITOR] Watching ${symbol} | Awaiting raw price feed...")
+            print(f"⏳ [MONITOR] Watching ${symbol} | CA: {mint} | Awaiting raw price feed...")
             continue
 
         pnl_pct = (current_price - entry_price) / entry_price
-        print(f"📈 [POSITION CHECK] ${symbol} | Current: ${current_price:.8f} | Entry: ${entry_price:.8f} | PnL: {pnl_pct*100:+.2f}%")
+        print(f"📈 [POSITION CHECK] ${symbol} | CA: {mint} | Current: ${current_price:.8f} | Entry: ${entry_price:.8f} | PnL: {pnl_pct*100:+.2f}%")
 
         # 1. Take Profit Trigger (+35%)
         if pnl_pct >= TAKE_PROFIT_PCT:
@@ -199,11 +209,11 @@ def check_active_positions():
             
             win_rate = (trade_stats["wins"] / trade_stats["total_closed"]) * 100
 
-            print(f"\n🎯 [TAKE PROFIT HIT] ${symbol} | Gain: +{pnl_pct*100:.2f}% (+{sol_gained:.4f} SOL)")
+            print(f"\n🎯 [TAKE PROFIT HIT] ${symbol} | CA: {mint} | Gain: +{pnl_pct*100:.2f}% (+{sol_gained:.4f} SOL)")
             print(f"📊 [STATS UPDATE] Closed: {trade_stats['total_closed']} | Win Rate: {win_rate:.1f}% | Net SOL: {trade_stats['net_sol_pnl']:+.4f} SOL")
             
             post_to_familiars(
-                f"🎉 [PAPER TP] Closed ${symbol} at +{pnl_pct*100:.2f}%! "
+                f"🎉 [PAPER TP] Closed ${symbol} ({mint}) at +{pnl_pct*100:.2f}%! "
                 f"Win Rate: {win_rate:.1f}% ({trade_stats['net_sol_pnl']:+.4f} SOL total)"
             )
             mints_to_close.append((mint, "TP"))
@@ -217,11 +227,11 @@ def check_active_positions():
             
             win_rate = (trade_stats["wins"] / trade_stats["total_closed"]) * 100
 
-            print(f"\n🛑 [STOP LOSS HIT] ${symbol} | Loss: {pnl_pct*100:.2f}% ({sol_lost:.4f} SOL)")
+            print(f"\n🛑 [STOP LOSS HIT] ${symbol} | CA: {mint} | Loss: {pnl_pct*100:.2f}% ({sol_lost:.4f} SOL)")
             print(f"📊 [STATS UPDATE] Closed: {trade_stats['total_closed']} | Win Rate: {win_rate:.1f}% | Net SOL: {trade_stats['net_sol_pnl']:+.4f} SOL")
             
             post_to_familiars(
-                f"🛑 [PAPER SL] Closed ${symbol} at {pnl_pct*100:.2f}%. "
+                f"🛑 [PAPER SL] Closed ${symbol} ({mint}) at {pnl_pct*100:.2f}%. "
                 f"Win Rate: {win_rate:.1f}% ({trade_stats['net_sol_pnl']:+.4f} SOL total)"
             )
             
@@ -239,7 +249,7 @@ def run_trading_loop():
     
     while True:
         try:
-            # 1. Update open position status (using raw price feed)
+            # 1. Update open position status
             check_active_positions()
 
             # 2. Single Position Enforcement
@@ -286,20 +296,21 @@ def run_trading_loop():
 
                 symbol = pair.get('baseToken', {}).get('symbol', 'UNKNOWN')
                 current_price = float(pair.get('priceUsd', 0) or 0)
+                mc = pair.get('marketCap') or pair.get('fdv', 0)
                 S = compute_markov_differential(pair)
 
                 if S is not None and S >= SIGNAL_THRESHOLD:
-                    print(f"\n[SIGNAL TRIGGERED] ${symbol} | Stride Signal S = +{S}")
+                    print(f"\n[SIGNAL TRIGGERED] ${symbol} | CA: {mint} | MC: ${mc:,.0f} | Stride Signal S = +{S}")
                     
                     if PAPER_TRADING:
                         active_positions[mint] = {
                             "symbol": symbol,
                             "entry_price": current_price
                         }
-                        print(f"[PAPER TRADE] Simulated BUY: {SOL_TRADE_SIZE} SOL into ${symbol} @ ${current_price:.8f}")
-                        print(f"[STATE] Active Position: ${symbol} | Monitoring price feed every 30s...")
+                        print(f"[PAPER TRADE] Simulated BUY: {SOL_TRADE_SIZE} SOL into ${symbol} | CA: {mint} @ ${current_price:.8f}")
+                        print(f"[STATE] Active Position: ${symbol} | CA: {mint} | Monitoring price feed every 30s...")
                         
-                        post_to_familiars(f"🎯 [PAPER BUY] Markov 2.0 entered ${symbol} (Signal S: +{S})")
+                        post_to_familiars(f"🎯 [PAPER BUY] Markov 2.0 entered ${symbol} (CA: {mint}) | MC: ${mc:,.0f} | Signal S: +{S}")
                         break
 
             time.sleep(30)
