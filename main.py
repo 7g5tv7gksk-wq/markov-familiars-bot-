@@ -43,37 +43,16 @@ trade_stats = {
 }
 
 # =====================================================================
-# MULTI-SOURCE ORGANIC CANDIDATE SCRAPER (PACED TO PREVENT 429)
+# RATE-LIMIT-PROOF CANDIDATE SCRAPER
 # =====================================================================
 def fetch_organic_candidates():
     """
-    Fetches active Solana token mints across DexScreener search terms,
-    recent profile updates, and Jupiter endpoints with built-in pacing.
+    Fetches active Solana token mints reliably without triggering DexScreener 429s.
+    Uses Jupiter API & Token Profiles endpoint.
     """
     candidate_mints = []
 
-    # Source A: Multi-query search across active Solana DEX pairs
-    search_terms = ["pump", "sol", "raydium", "moon"]
-    for term in search_terms:
-        try:
-            url = f"https://api.dexscreener.com/latest/dex/search?q={term}"
-            res = requests.get(url, timeout=5)
-            if res.status_code == 200:
-                pairs = res.json().get('pairs', [])
-                if pairs:
-                    for p in pairs:
-                        if p.get('chainId') == 'solana':
-                            base_mint = p.get('baseToken', {}).get('address')
-                            if base_mint and base_mint not in candidate_mints:
-                                candidate_mints.append(base_mint)
-            elif res.status_code == 429:
-                print("⚠️ [SCRAPER RATE LIMIT] Throttled on search term. Backing off...")
-                time.sleep(2)
-        except Exception:
-            pass
-        time.sleep(0.3)  # Pacing to avoid hitting 429 rate limit
-
-    # Source B: Token Profiles (Recent Updates)
+    # Source A: Recent Token Profiles (Safe 60 req/min endpoint)
     try:
         profile_url = "https://api.dexscreener.com/token-profiles/recent-updates/v1"
         res = requests.get(profile_url, timeout=5)
@@ -85,20 +64,39 @@ def fetch_organic_candidates():
                         addr = item.get('tokenAddress')
                         if addr and addr not in candidate_mints:
                             candidate_mints.append(addr)
+        elif res.status_code == 429:
+            print("⚠️ [DEX PROFILES 429] Throttled on profiles endpoint.")
     except Exception:
         pass
 
-    # Source C: Fallback to Jupiter API if candidate list is thin
-    if len(candidate_mints) < 10:
-        try:
-            jup_url = "https://tokens.jup.ag/tokens?tags=verified"
-            res = requests.get(jup_url, timeout=5)
-            if res.status_code == 200:
-                tokens = res.json()
-                for t in tokens[:30]:
+    # Source B: Jupiter Active Strict/Verified Token List (No Rate Limit)
+    try:
+        jup_url = "https://tokens.jup.ag/tokens?tags=community"
+        res = requests.get(jup_url, timeout=5)
+        if res.status_code == 200:
+            tokens = res.json()
+            if isinstance(tokens, list):
+                # Grab latest active community mints
+                for t in tokens[:40]:
                     addr = t.get('address')
                     if addr and addr not in candidate_mints:
                         candidate_mints.append(addr)
+    except Exception:
+        pass
+
+    # Source C: Single DexScreener Search (Fallback, single query only)
+    if len(candidate_mints) < 15:
+        try:
+            url = "https://api.dexscreener.com/latest/dex/search?q=sol"
+            res = requests.get(url, timeout=5)
+            if res.status_code == 200:
+                pairs = res.json().get('pairs', [])
+                if pairs:
+                    for p in pairs:
+                        if p.get('chainId') == 'solana':
+                            base_mint = p.get('baseToken', {}).get('address')
+                            if base_mint and base_mint not in candidate_mints:
+                                candidate_mints.append(base_mint)
         except Exception:
             pass
 
@@ -153,10 +151,7 @@ def check_rugcheck_safety(token_mint):
 # BATCH DEX PAIR FETCHING & MARKOV DIFFERENTIAL
 # =====================================================================
 def get_batch_dex_pairs(token_mints):
-    """
-    Fetches up to 30 token pair profiles in 1 single HTTP request
-    to completely prevent DexScreener rate-limiting.
-    """
+    """Fetches up to 30 token profiles in 1 single HTTP request."""
     if not token_mints:
         return {}
     
@@ -166,8 +161,8 @@ def get_batch_dex_pairs(token_mints):
     try:
         res = requests.get(url, timeout=10)
         if res.status_code == 429:
-            print("⚠️ [DEX BATCH RATE LIMIT] Throttled by DexScreener. Pausing 5s...")
-            time.sleep(5)
+            print("⚠️ [DEX BATCH RATE LIMIT] Throttled by DexScreener. Backing off 15s...")
+            time.sleep(15)
             return {}
             
         if res.status_code != 200:
@@ -176,7 +171,6 @@ def get_batch_dex_pairs(token_mints):
         data = res.json()
         pairs = data.get('pairs', [])
         
-        # Group highest liquidity pair per base token mint
         mint_pair_map = {}
         if pairs:
             for pair in pairs:
@@ -357,11 +351,10 @@ def run_trading_loop():
             mints = fetch_organic_candidates()
 
             if not mints:
-                print("⚠️ [SCRAPER] No candidates returned this cycle. Retrying in 10s...")
-                time.sleep(10)
+                print("⚠️ [SCRAPER] No candidates returned this cycle. Retrying in 15s...")
+                time.sleep(15)
                 continue
 
-            # Clean up active/blacklisted mints from batch lookup list
             eval_mints = [
                 m for m in mints 
                 if m not in active_positions and 
@@ -405,7 +398,7 @@ def run_trading_loop():
                         print(f"🟢 [PAPER ENTRY] Simulated BUY: {SOL_TRADE_SIZE} SOL into ${symbol} @ ${current_price:.8f}")
                         break
 
-            time.sleep(15)
+            time.sleep(20)
             
         except Exception as e:
             print(f"[LOOP ERROR] {e}")
@@ -432,4 +425,3 @@ if __name__ == "__main__":
     monitor_thread.start()
 
     run_trading_loop()
-l
