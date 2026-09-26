@@ -609,7 +609,7 @@ def run_bot():
                 time.sleep(LOOP_INTERVAL)
                 continue
 
-            # Refresh Markov state on active trackers (spaced out by limiter internal locks)
+            # Refresh existing trackers
             for tracker in list(coin_trackers.values()):
                 tracker.refresh()
 
@@ -641,23 +641,22 @@ def run_bot():
                 mc           = float(pair.get("marketCap") or pair.get("fdv", 0) or 0)
 
                 if not check_rugcheck(mint):
-                    logging.info(f"🛡️ [REJECTED] ${symbol} — RugCheck fail")
                     continue
                 if not check_gmgn(mint):
-                    logging.info(f"🛡️ [REJECTED] ${symbol} — GMGN fail")
                     continue
 
+                # Instantiate and add candidate to tracking dictionary first
                 if mint not in coin_trackers:
                     coin_trackers[mint] = CoinMarkovTracker(mint, pair_address, symbol)
 
                 tracker = coin_trackers[mint]
                 tracker.refresh()
 
-                # ── Dynamic Regime Filters ───────────────────────────
+                # --- REGIME-AWARE EVALUATION ---
                 if sol_regime == "SIDEWAYS":
-                    # In SIDEWAYS regimes: Reject cold-start momentum entirely
+                    # Keep in tracking dict, but bypass trade consideration until fully indexed
                     if not tracker.ready:
-                        logging.info(f"🚫 [REJECTED] ${symbol} — Cold momentum disabled in SOL=SIDEWAYS")
+                        logging.info(f"⏳ [BUILDING DATA] ${symbol} | Windows={tracker.windows}/{MIN_WINDOWS}")
                         continue
                     threshold = SIDEWAYS_MARKOV_THRESHOLD
                     current_sl_pct = SIDEWAYS_STOP_LOSS_PCT
@@ -683,7 +682,7 @@ def run_bot():
                 if signal < threshold:
                     continue
 
-                # Owner limit check
+                # Limits check
                 limits      = familiars_limits()
                 max_pos_usd = limits.get("maxPositionUsd")
                 if max_pos_usd:
@@ -695,7 +694,7 @@ def run_bot():
                         )
                         continue
 
-                # ── Entry Execution ─────────────────────────────────
+                # Entry execution
                 reason_parts = [
                     f"${symbol}", f"MC=${mc:,.0f}",
                     f"SOL={sol_regime}", f"Signal={signal:+.3f} [{signal_src}]"
