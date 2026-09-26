@@ -3,6 +3,7 @@ import time
 import logging
 import threading
 import requests
+from collections import deque
 from flask import Flask
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
@@ -25,8 +26,12 @@ STRIDE_BARS  = 4              # Non-overlapping window size (4 × 5m = 20-min ep
 MIN_WINDOWS  = 12             # Min stride windows before Markov signal is trusted (~4 h)
 ATR_BULL_MULT = 0.5           # Window return > +0.5×ATR% → BULL
 ATR_BEAR_MULT = 0.5           # Window return < -0.5×ATR% → BEAR
-MARKOV_THRESHOLD   = 0.20     # P(bull) − P(bear) required to enter via Markov layer
-MOMENTUM_THRESHOLD = 0.25     # Threshold for cold-start momentum fallback
+MARKOV_THRESHOLD   = 0.20     # Standard P(bull) − P(bear) threshold
+MOMENTUM_THRESHOLD = 0.25     # Cold-start momentum threshold in BULL regimes
+
+# ── Sideways Regime Parameters ────────────────────────────────────────
+SIDEWAYS_MARKOV_THRESHOLD = 0.45  # Stricter threshold during SOL=SIDEWAYS
+SIDEWAYS_STOP_LOSS_PCT    = 0.08  # Tightened stop loss (8%) during chop
 
 # SOL macro regime (simple % change rules — no extra API needed)
 SOL_BEAR_H24  = -15.0
@@ -35,7 +40,7 @@ SOL_USDC_PAIR = "HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ"   # Raydium SOL/U
 
 # Position management
 TAKE_PROFIT_PCT      = 0.35
-STOP_LOSS_PCT        = 0.12
+STOP_LOSS_PCT        = 0.12   # Default stop-loss for BULL regimes
 BLACKLIST_COOLDOWN   = 7200   # 2 hours after a stop-loss
 MAX_POSITIONS        = 1
 LOOP_INTERVAL        = 15     # seconds between scan cycles
@@ -46,13 +51,39 @@ FAMILIARS_KEY = os.environ.get("FAMILIARS_API_KEY", "")
 FAMILIARS_URL = "https://familiars.family"
 
 # =====================================================================
-# STATE
+# STATE & RATE LIMITING
 # =====================================================================
-active_positions  = {}    # mint → {symbol, entry_price}
-stopped_out_tokens= {}    # mint → timestamp of stop-out
-coin_trackers     = {}    # mint → CoinMarkovTracker
-trade_stats = {"total_closed": 0, "wins": 0, "losses": 0, "net_sol_pnl": 0.0}
-_sol_cache = {"state": "SIDEWAYS", "last_check": 0}
+active_positions   = {}    # mint → {symbol, entry_price, sl_pct}
+stopped_out_tokens = {}    # mint → timestamp of stop-out
+coin_trackers      = {}    # mint → CoinMarkovTracker
+ohlcv_cache        = {}    # pool_address → {data, timestamp}
+trade_stats        = {"total_closed": 0, "wins": 0, "losses": 0, "net_sol_pnl": 0.0}
+_sol_cache         = {"state": "SIDEWAYS", "last_check": 0}
+
+class RateLimiter:
+    """Sliding-window rate limiter designed for standard public free tiers."""
+    def __init__(self, max_calls, period):
+        self.max_calls = max_calls
+        self.period = period
+        self.calls = deque()
+        self.lock = threading.Lock()
+
+    def wait_if_needed(self):
+        with self.lock:
+            now = time.time()
+            while self.calls and self.calls[0] <= now - self.period:
+                self.calls.popleft()
+            if len(self.calls) >= self.max_calls:
+                sleep_time = self.period - (now - self.calls[0])
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                now = time.time()
+                while self.calls and self.calls[0] <= now - self.period:
+                    self.calls.popleft()
+            self.calls.append(now)
+
+# GeckoTerminal free tier limit: ~30 calls/min. We throttle conservatively at 25 calls/60s.
+gecko_limiter = RateLimiter(max_calls=25, period=60)
 
 # Markov state constants
 BULL, SIDEWAYS, BEAR = 0, 1, 2
@@ -63,11 +94,6 @@ STATE_NAME = {BULL: "BULL", SIDEWAYS: "SIDEWAYS", BEAR: "BEAR"}
 # FAMILIARS INTEGRATION
 # =====================================================================
 def familiars_post(kind, text, mint=None, signature=None):
-    """
-    Post a callout or trade explanation to the Familiars public feed.
-    kind: "callout" | "trade" | "note"
-    Trades on-chain show up automatically; this adds our reasoning.
-    """
     if not FAMILIARS_KEY:
         return
     payload = {"kind": kind, "text": text[:500]}
@@ -87,10 +113,6 @@ def familiars_post(kind, text, mint=None, signature=None):
 
 
 def familiars_limits():
-    """
-    Read owner-set limits (maxPositionUsd, dailyLimitUsd, instructions)
-    before every entry. Returns {} if not configured.
-    """
     if not FAMILIARS_KEY:
         return {}
     try:
@@ -108,11 +130,8 @@ def familiars_limits():
 
 # =====================================================================
 # LAYER 1 — SOL MACRO REGIME
-# Uses DexScreener % changes on SOL/USDC (free, no key, cached 5 min).
-# If SOL is in freefall the bot sits out entirely.
 # =====================================================================
 def get_sol_regime():
-    """Returns "BULL" | "SIDEWAYS" | "BEAR". Cached for OHLCV_TTL seconds."""
     now = time.time()
     if now - _sol_cache["last_check"] < OHLCV_TTL:
         return _sol_cache["state"]
@@ -146,14 +165,20 @@ def get_sol_regime():
 
 
 # =====================================================================
-# OHLCV — GECKOTERMINAL  (free, keyless)
+# OHLCV — GECKOTERMINAL (Rate-Limited & Cached)
 # =====================================================================
 def fetch_ohlcv(pool_address, agg_min=5, limit=200):
-    """
-    Fetch 5m OHLCV candles for a Solana pool from GeckoTerminal.
-    Returns list[dict] oldest-first, or [] if pool not yet indexed.
-    DexScreener pairAddress == GeckoTerminal pool address for Raydium/Orca.
-    """
+    now = time.time()
+    
+    # Check cache first
+    if pool_address in ohlcv_cache:
+        cached_entry = ohlcv_cache[pool_address]
+        if now - cached_entry["timestamp"] < OHLCV_TTL:
+            return cached_entry["data"]
+
+    # Rate limiting space out
+    gecko_limiter.wait_if_needed()
+
     url = (
         f"https://api.geckoterminal.com/api/v2/networks/solana"
         f"/pools/{pool_address}/ohlcv/minute"
@@ -162,11 +187,11 @@ def fetch_ohlcv(pool_address, agg_min=5, limit=200):
     try:
         r = requests.get(url, headers={"Accept": "application/json"}, timeout=8)
         if r.status_code == 404:
-            return []      # Pool not indexed yet — very new pair, fall back to momentum
-        if r.status_code == 429:
-            logging.warning("⚠️ [GECKO] Rate limited — waiting 10s")
-            time.sleep(10)
             return []
+        if r.status_code == 429:
+            logging.warning("⚠️ [GECKO] Rate limit hit — backing off 12s")
+            time.sleep(12)
+            return ohlcv_cache.get(pool_address, {}).get("data", [])
         if r.status_code != 200:
             return []
 
@@ -174,30 +199,27 @@ def fetch_ohlcv(pool_address, agg_min=5, limit=200):
         if not raw:
             return []
 
-        # GeckoTerminal returns newest-first; reverse to oldest-first for the engine
-        return [
+        candles = [
             {"ts": c[0], "o": float(c[1]), "h": float(c[2]),
              "l": float(c[3]), "c": float(c[4]), "v": float(c[5])}
             for c in reversed(raw)
-            if c[1] and c[4]   # skip zero/null candles
+            if c[1] and c[4]
         ]
+        
+        ohlcv_cache[pool_address] = {"data": candles, "timestamp": now}
+        return candles
+
     except Exception as e:
         logging.error(f"❌ [GECKO OHLCV] {pool_address[:8]}…: {e}")
-        return []
+        return ohlcv_cache.get(pool_address, {}).get("data", [])
 
 
 # =====================================================================
-# MARKOV 2.0 ENGINE — THREE FIXES IMPLEMENTED
+# MARKOV 2.0 ENGINE
 # =====================================================================
-
 def _atr_pct(candles, period=14):
-    """
-    Average True Range as % of close.
-    Used to set adaptive BULL/BEAR thresholds so the same parameters work
-    across coins ranging from 0.001% to 50% daily vol.
-    """
     if len(candles) < period + 1:
-        return 3.0     # Fallback: 3% if not enough history
+        return 3.0
     trs = []
     for i in range(1, len(candles)):
         h, l, pc = candles[i]["h"], candles[i]["l"], candles[i-1]["c"]
@@ -209,19 +231,7 @@ def _atr_pct(candles, period=14):
 
 
 def _label_states(candles, stride, bull_mult, bear_mult):
-    """
-    FIX 1 — Stride sampling.
-
-    NEVER build the matrix from overlapping windows.
-    Consecutive 20-day windows share 19 days → fakes persistence on the diagonal.
-    Here we step through NON-OVERLAPPING windows of `stride` bars.
-
-    Threshold is ATR-adaptive: a coin moving 50% daily needs much wider bands
-    than a coin moving 2% daily. Same parameters, different coins.
-
-    Returns: (states[], bull_threshold%, bear_threshold%)
-    """
-    atr        = _atr_pct(candles)
+    atr         = _atr_pct(candles)
     bull_thresh = atr * bull_mult
     bear_thresh = -atr * bear_mult
     states = []
@@ -241,12 +251,6 @@ def _label_states(candles, stride, bull_mult, bear_mult):
 
 
 def _build_matrix(states):
-    """
-    Build a 3×3 transition probability matrix.
-    Rows = from-state, Cols = to-state, each row sums to 1.
-    Returns (matrix, stickiness_dict).
-    Stickiness = diagonal values — how likely each regime is to persist.
-    """
     counts = [[0, 0, 0], [0, 0, 0], [0, 0, 0]]
     for i in range(len(states) - 1):
         counts[states[i]][states[i+1]] += 1
@@ -261,14 +265,6 @@ def _build_matrix(states):
 
 
 def _verify_labels(states, candles, stride):
-    """
-    FIX 2 — Label verification.
-
-    After building any matrix, self-check the state labels against
-    three known windows (first, middle, last).  A large positive return
-    labelled BEAR — or vice versa — means the threshold calibration is off.
-    Logs a warning; the engine continues but flags lower confidence.
-    """
     errors = 0
     for idx in [0, len(states) // 2, len(states) - 1]:
         start = idx * stride
@@ -281,17 +277,12 @@ def _verify_labels(states, candles, stride):
 
     if errors:
         logging.warning(
-            f"⚠️ [MARKOV FIX2] {errors} label anomaly(s) — "
-            f"matrix built but confidence is lower"
+            f"⚠️ [MARKOV FIX2] {errors} label anomaly(s) — matrix built but confidence is lower"
         )
     return errors == 0
 
 
 def _markov_signal(matrix, current_state):
-    """
-    Signal = P(BULL tomorrow | current state) − P(BEAR tomorrow | current state).
-    Range: −1.0 to +1.0.  Positive = bullish conviction.
-    """
     return round(matrix[current_state][BULL] - matrix[current_state][BEAR], 4)
 
 
@@ -299,49 +290,37 @@ def _markov_signal(matrix, current_state):
 # PER-COIN MARKOV TRACKER
 # =====================================================================
 class CoinMarkovTracker:
-    """
-    Accumulates 5m OHLCV history for one coin and maintains a live Markov signal.
-    Cold starts gracefully: signal is None until MIN_WINDOWS stride windows exist.
-    The bot falls back to the momentum signal in the meantime.
-    """
-
     def __init__(self, mint, pair_address, symbol):
-        self.mint         = mint
-        self.pair_address = pair_address
-        self.symbol       = symbol
-        self.candles      = []
-        self.states       = []
-        self.matrix       = None
-        self.stickiness   = None
-        self.signal       = None
-        self.current_state= SIDEWAYS
-        self.windows      = 0
-        self.last_fetch   = 0
-        self.verified     = False
+        self.mint          = mint
+        self.pair_address  = pair_address
+        self.symbol        = symbol
+        self.candles       = []
+        self.states        = []
+        self.matrix        = None
+        self.stickiness    = None
+        self.signal        = None
+        self.current_state = SIDEWAYS
+        self.windows       = 0
+        self.last_fetch    = 0
+        self.verified      = False
 
     @property
     def ready(self):
-        """True once the matrix has enough data to be meaningful."""
         return self.windows >= MIN_WINDOWS and self.signal is not None
 
     @property
     def confidence(self):
-        """
-        0 → MIN_WINDOWS: 0.0 (not ready)
-        MIN_WINDOWS → 4×MIN_WINDOWS: 0.0 → 1.0 (growing confidence)
-        """
         if self.windows < MIN_WINDOWS:
             return 0.0
         return min((self.windows - MIN_WINDOWS) / (MIN_WINDOWS * 3), 1.0)
 
     def refresh(self):
-        """Pull latest candles and recompute the Markov signal. No-op if TTL hasn't passed."""
         if time.time() - self.last_fetch < OHLCV_TTL:
             return
 
         candles = fetch_ohlcv(self.pair_address)
         if not candles:
-            return    # Pool not indexed yet — keep existing signal (or None)
+            return
 
         self.candles    = candles
         self.last_fetch = time.time()
@@ -370,13 +349,12 @@ class CoinMarkovTracker:
 
 
 # =====================================================================
-# CANDIDATE SCRAPER  (multi-source, rate-limit safe)
+# CANDIDATE SCRAPER & DEX BATCH
 # =====================================================================
 def fetch_organic_candidates():
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     mints = []
 
-    # Source A: DexScreener trending SOL search
     try:
         r = requests.get(
             "https://api.dexscreener.com/latest/dex/search?q=sol",
@@ -391,7 +369,6 @@ def fetch_organic_candidates():
     except Exception as e:
         logging.warning(f"⚠️ [SCRAPER] DexScreener: {e}")
 
-    # Source B: Jupiter recent mints V2
     try:
         r = requests.get(
             "https://api.jup.ag/tokens/v2/recent",
@@ -407,29 +384,9 @@ def fetch_organic_candidates():
     except Exception as e:
         logging.warning(f"⚠️ [SCRAPER] Jupiter: {e}")
 
-    # Source C: DexScreener token profiles (fallback if A+B thin)
-    if len(mints) < 10:
-        try:
-            r = requests.get(
-                "https://api.dexscreener.com/token-profiles/latest/v1",
-                headers=headers, timeout=5
-            )
-            if r.status_code == 200:
-                for item in r.json()[:20]:
-                    if item.get("chainId") == "solana":
-                        addr = item.get("tokenAddress")
-                        if addr and addr not in mints:
-                            mints.append(addr)
-        except Exception as e:
-            logging.warning(f"⚠️ [SCRAPER] DexScreener profiles: {e}")
-
-    logging.info(f"📡 [SCRAPER] {len(mints[:30])} candidate mints")
     return mints[:30]
 
 
-# =====================================================================
-# BATCH DEX DATA  (single DexScreener call for up to 30 mints)
-# =====================================================================
 def fetch_dex_batch(mints):
     if not mints:
         return {}
@@ -452,10 +409,9 @@ def fetch_dex_batch(mints):
 
 
 # =====================================================================
-# PAIR FILTERS
+# PAIR FILTERS & MOMENTUM
 # =====================================================================
 def validate_pair(pair):
-    """Enforces liquidity, MC band, volume, drawdown, and buy/sell ratio."""
     if not pair:
         return False
     liq = float(pair.get("liquidity", {}).get("usd", 0) or 0)
@@ -480,24 +436,14 @@ def validate_pair(pair):
     return True
 
 
-# =====================================================================
-# LAYER 2 — MOMENTUM SIGNAL  (cold-start fallback)
-# Used when GeckoTerminal hasn't indexed the pair yet or data < MIN_WINDOWS.
-# This is the original compute_markov_differential, renamed to be honest.
-# =====================================================================
 def compute_momentum_signal(pair):
-    """
-    Velocity-acceleration signal built from DexScreener snapshot % changes.
-    Works on any pair immediately with no OHLCV history.
-    Returns float signal or None (rejects anti-top-blast conditions).
-    """
     pc  = pair.get("priceChange", {})
     m5  = float(pc.get("m5",  0) or 0)
     h1  = float(pc.get("h1",  0) or 0)
     h6  = float(pc.get("h6",  0) or 0)
 
     if h1 > 50 or m5 > 30:
-        return None   # Anti-top-blast: already ripping — skip
+        return None
 
     v_m5 = m5  / 5.0
     v_h1 = h1  / 60.0
@@ -514,7 +460,6 @@ def compute_momentum_signal(pair):
 # SECURITY CHECKS
 # =====================================================================
 def check_gmgn(mint):
-    """Reject if bundler cluster > 10% or rug ratio > 0.30."""
     try:
         r = requests.get(
             f"https://gmgn.ai/defi/quotation/v1/tokens/sol/{mint}",
@@ -532,7 +477,6 @@ def check_gmgn(mint):
 
 
 def check_rugcheck(mint):
-    """Reject Danger/High risk or mint/freeze/concentration flags."""
     try:
         r = requests.get(
             f"https://api.rugcheck.xyz/v1/tokens/{mint}/report/summary",
@@ -553,7 +497,7 @@ def check_rugcheck(mint):
 
 
 # =====================================================================
-# REAL-TIME PRICE  (Jupiter V2 → DexScreener fallback)
+# REAL-TIME PRICE
 # =====================================================================
 def get_price(mint):
     try:
@@ -579,7 +523,7 @@ def get_price(mint):
 
 
 # =====================================================================
-# POSITION MONITOR — 1-second background thread
+# POSITION MONITOR
 # =====================================================================
 def run_monitor():
     logging.info("⚡ [MONITOR] Position monitor started (1s loop)")
@@ -592,8 +536,9 @@ def run_monitor():
                     if not price or info["entry_price"] == 0:
                         continue
 
-                    pnl    = (price - info["entry_price"]) / info["entry_price"]
-                    symbol = info["symbol"]
+                    pnl          = (price - info["entry_price"]) / info["entry_price"]
+                    symbol       = info["symbol"]
+                    stop_loss_limit = info.get("sl_pct", STOP_LOSS_PCT)
 
                     if pnl >= TAKE_PROFIT_PCT:
                         sol_gain = SOL_TRADE_SIZE * pnl
@@ -608,13 +553,12 @@ def run_monitor():
                         )
                         familiars_post(
                             "trade",
-                            f"TP +{pnl*100:.1f}% on ${symbol}. "
-                            f"Net={trade_stats['net_sol_pnl']:+.4f} SOL",
+                            f"TP +{pnl*100:.1f}% on ${symbol}. Net={trade_stats['net_sol_pnl']:+.4f} SOL",
                             mint=mint
                         )
                         to_close.append(mint)
 
-                    elif pnl <= -STOP_LOSS_PCT:
+                    elif pnl <= -stop_loss_limit:
                         sol_loss = SOL_TRADE_SIZE * pnl
                         trade_stats["total_closed"] += 1
                         trade_stats["losses"]        += 1
@@ -627,8 +571,7 @@ def run_monitor():
                         )
                         familiars_post(
                             "trade",
-                            f"SL {pnl*100:.1f}% on ${symbol}. "
-                            f"Blacklisting for 2h.",
+                            f"SL {pnl*100:.1f}% on ${symbol}. Blacklisting for 2h.",
                             mint=mint
                         )
                         stopped_out_tokens[mint] = time.time()
@@ -636,7 +579,7 @@ def run_monitor():
 
                 for mint in to_close:
                     active_positions.pop(mint, None)
-                    coin_trackers.pop(mint, None)    # Clear stale tracker on exit
+                    coin_trackers.pop(mint, None)
 
         except Exception as e:
             logging.error(f"❌ [MONITOR] {e}")
@@ -647,22 +590,6 @@ def run_monitor():
 # MAIN TRADING LOOP
 # =====================================================================
 def run_bot():
-    """
-    Three-layer entry logic:
-
-    Layer 1 — SOL macro regime (DexScreener, cached 5 min)
-        BEAR → sit out this cycle entirely
-
-    Layer 2 — Momentum signal (instant, no OHLCV needed)
-        Used during cold start or when GeckoTerminal hasn't indexed the pair yet
-
-    Layer 3 — Markov 2.0 signal (GeckoTerminal OHLCV, 4-bar stride, ATR-adaptive)
-        Replaces Layer 2 once MIN_WINDOWS stride windows have accumulated
-
-    FIX 3 — STANDALONE mode:
-        The Markov/momentum differential IS the strategy.
-        There is no separate user strategy being filtered.
-    """
     logging.info(
         f"🚀 [BOT] Markov 2.0 Engine active | "
         f"Paper={PAPER_TRADING} | Stride={STRIDE_BARS}×5m | "
@@ -676,24 +603,20 @@ def run_bot():
                 time.sleep(LOOP_INTERVAL)
                 continue
 
-            # ── Layer 1: SOL macro gate ──────────────────────────────
             sol_regime = get_sol_regime()
             if sol_regime == "BEAR":
                 logging.info("🚫 [MACRO] SOL=BEAR — sitting out this cycle")
                 time.sleep(LOOP_INTERVAL)
                 continue
 
-            # Refresh Markov on coins already in our tracker pool
+            # Refresh Markov state on active trackers (spaced out by limiter internal locks)
             for tracker in list(coin_trackers.values()):
                 tracker.refresh()
 
             logging.info(
-                f"🔎 [SCAN] SOL={sol_regime} | "
-                f"Tracking={len(coin_trackers)} coins | "
-                f"Active={len(active_positions)}"
+                f"🔎 [SCAN] SOL={sol_regime} | Tracking={len(coin_trackers)} coins | Active={len(active_positions)}"
             )
 
-            # Scrape + batch fetch
             mints    = fetch_organic_candidates()
             pair_map = fetch_dex_batch(mints) if mints else {}
 
@@ -703,7 +626,6 @@ def run_bot():
                 if mint in active_positions:
                     continue
 
-                # Blacklist check
                 if mint in stopped_out_tokens:
                     if time.time() - stopped_out_tokens[mint] < BLACKLIST_COOLDOWN:
                         continue
@@ -718,7 +640,6 @@ def run_bot():
                 price        = float(pair.get("priceUsd", 0) or 0)
                 mc           = float(pair.get("marketCap") or pair.get("fdv", 0) or 0)
 
-                # Security screen
                 if not check_rugcheck(mint):
                     logging.info(f"🛡️ [REJECTED] ${symbol} — RugCheck fail")
                     continue
@@ -726,23 +647,30 @@ def run_bot():
                     logging.info(f"🛡️ [REJECTED] ${symbol} — GMGN fail")
                     continue
 
-                # ── Layers 2 / 3: signal selection ──────────────────
                 if mint not in coin_trackers:
                     coin_trackers[mint] = CoinMarkovTracker(mint, pair_address, symbol)
 
                 tracker = coin_trackers[mint]
                 tracker.refresh()
 
+                # ── Dynamic Regime Filters ───────────────────────────
+                if sol_regime == "SIDEWAYS":
+                    # In SIDEWAYS regimes: Reject cold-start momentum entirely
+                    if not tracker.ready:
+                        logging.info(f"🚫 [REJECTED] ${symbol} — Cold momentum disabled in SOL=SIDEWAYS")
+                        continue
+                    threshold = SIDEWAYS_MARKOV_THRESHOLD
+                    current_sl_pct = SIDEWAYS_STOP_LOSS_PCT
+                else:
+                    threshold = MARKOV_THRESHOLD if tracker.ready else MOMENTUM_THRESHOLD
+                    current_sl_pct = STOP_LOSS_PCT
+
                 if tracker.ready:
-                    # Layer 3: real Markov 2.0
                     signal     = tracker.signal
                     signal_src = f"Markov(conf={tracker.confidence:.0%})"
-                    threshold  = MARKOV_THRESHOLD
                 else:
-                    # Layer 2: momentum fallback (cold start)
                     signal     = compute_momentum_signal(pair)
                     signal_src = f"Momentum(cold,w={tracker.windows})"
-                    threshold  = MOMENTUM_THRESHOLD
 
                 if signal is None:
                     continue
@@ -755,20 +683,19 @@ def run_bot():
                 if signal < threshold:
                     continue
 
-                # ── Familiars owner limit check ──────────────────────
+                # Owner limit check
                 limits      = familiars_limits()
                 max_pos_usd = limits.get("maxPositionUsd")
                 if max_pos_usd:
-                    sol_price_est = 150    # rough estimate for limit check
+                    sol_price_est = 150
                     trade_usd = SOL_TRADE_SIZE * sol_price_est
                     if trade_usd > float(max_pos_usd):
                         logging.warning(
-                            f"⛔ [LIMITS] Trade ~${trade_usd:.0f} "
-                            f"exceeds owner cap ${max_pos_usd}"
+                            f"⛔ [LIMITS] Trade ~${trade_usd:.0f} exceeds owner cap ${max_pos_usd}"
                         )
                         continue
 
-                # ── Entry ────────────────────────────────────────────
+                # ── Entry Execution ─────────────────────────────────
                 reason_parts = [
                     f"${symbol}", f"MC=${mc:,.0f}",
                     f"SOL={sol_regime}", f"Signal={signal:+.3f} [{signal_src}]"
@@ -784,14 +711,14 @@ def run_bot():
                 familiars_post("callout", f"Entering {reason}", mint=mint)
 
                 if PAPER_TRADING:
-                    active_positions[mint] = {"symbol": symbol, "entry_price": price}
+                    active_positions[mint] = {
+                        "symbol": symbol,
+                        "entry_price": price,
+                        "sl_pct": current_sl_pct
+                    }
                     logging.info(
-                        f"💰 [PAPER] BUY {SOL_TRADE_SIZE} SOL → "
-                        f"${symbol} @ ${price:.8f}"
+                        f"💰 [PAPER] BUY {SOL_TRADE_SIZE} SOL → ${symbol} @ ${price:.8f} | SL={current_sl_pct*100:.0f}%"
                     )
-                # ── Live execution stub ──────────────────────────────
-                # When ready: set PAPER_TRADING = False and add Jupiter swap here
-                # jupiter_swap(mint, SOL_TRADE_SIZE, slippage_bps=100)
 
         except Exception as e:
             logging.error(f"❌ [LOOP] {e}")
@@ -820,9 +747,6 @@ def run_flask():
     app.run(host="0.0.0.0", port=port)
 
 
-# =====================================================================
-# ENTRY POINT
-# =====================================================================
 if __name__ == "__main__":
     threading.Thread(target=run_flask,  daemon=True).start()
     threading.Thread(target=run_monitor, daemon=True).start()
