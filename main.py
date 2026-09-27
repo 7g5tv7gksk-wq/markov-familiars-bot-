@@ -38,6 +38,9 @@ SOL_MINT     = "So11111111111111111111111111111111111111112"
 TAKE_PROFIT_PCT      = 0.35
 STOP_LOSS_PCT        = 0.12
 BLACKLIST_COOLDOWN   = 7200   # 2 hours after a stop-loss
+SECURITY_REJECT_COOLDOWN = 14400  # 4 hours after a RugCheck/GMGN fail — mint/freeze
+                                    # authority and holder concentration rarely change
+                                    # quickly, so re-checking every cycle just burns calls
 MAX_POSITIONS        = 1
 LOOP_INTERVAL        = 15     # seconds between scan cycles
 OHLCV_TTL            = 300    # seconds between GeckoTerminal refreshes once we HAVE candles (5 min = 1 candle)
@@ -56,6 +59,7 @@ JUP_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 # =====================================================================
 active_positions  = {}    # mint → {symbol, entry_price}
 stopped_out_tokens= {}    # mint → timestamp of stop-out
+security_rejected = {}    # mint → timestamp of RugCheck/GMGN rejection
 coin_trackers     = {}    # mint → CoinMarkovTracker
 trade_stats = {"total_closed": 0, "wins": 0, "losses": 0, "net_sol_pnl": 0.0}
 _sol_cache = {"state": "SIDEWAYS", "last_check": 0}
@@ -764,6 +768,7 @@ def run_bot():
             # entries" and "no token data at all" look identical in the logs.
             tally = {
                 "total": len(mints), "in_position_or_blacklist": 0,
+                "security_blacklist_skip": 0,
                 "no_token_data": 0, "failed_filters": 0,
                 "security_rejected": 0, "no_signal": 0,
                 "below_threshold": 0, "qualified": 0,
@@ -794,14 +799,24 @@ def run_bot():
                 price               = float(token.get("usdPrice") or 0)
                 mc                  = float(token.get("mcap") or token.get("fdv") or 0)
 
+                # Security blacklist check — skip re-querying RugCheck/GMGN for
+                # a mint we already know failed recently.
+                if mint in security_rejected:
+                    if time.time() - security_rejected[mint] < SECURITY_REJECT_COOLDOWN:
+                        tally["security_blacklist_skip"] += 1
+                        continue
+                    del security_rejected[mint]
+
                 # Security screen
                 if not check_rugcheck(mint):
                     logging.info(f"🛡️ [REJECTED] ${symbol} — RugCheck fail")
                     tally["security_rejected"] += 1
+                    security_rejected[mint] = time.time()
                     continue
                 if not check_gmgn(mint):
                     logging.info(f"🛡️ [REJECTED] ${symbol} — GMGN fail")
                     tally["security_rejected"] += 1
+                    security_rejected[mint] = time.time()
                     continue
 
                 # ── Layers 2 / 3: signal selection ──────────────────
@@ -851,6 +866,7 @@ def run_bot():
                 logging.info(
                     f"🔍 [FUNNEL] {tally['total']} candidates → "
                     f"skip={tally['in_position_or_blacklist']} | "
+                    f"security_blacklist={tally['security_blacklist_skip']} | "
                     f"no_token_data={tally['no_token_data']} | "
                     f"failed_filters={tally['failed_filters']} | "
                     f"security_rejected={tally['security_rejected']} | "
